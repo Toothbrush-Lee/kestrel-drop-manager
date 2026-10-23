@@ -138,7 +138,7 @@ class Terminal:
         self.action = action
         self.progress = ''
         self.job = Job(self.library.root, arguments)
-        self.message = {'scan': '正在扫描蓝牙广播…', 'list': '正在校验本地档案…',
+        self.message = {'scan': '正在扫描蓝牙广播…', 'list': '正在读取本地档案…',
                         'download': '正在连接设备；c 可取消并保留已落盘数据…'}.get(action, '正在处理…')
         self.logs.append('> ' + ' '.join(arguments))
 
@@ -161,9 +161,11 @@ class Terminal:
             self.action = None
             self.message = ('已取消；已落盘数据保留，可再次下载' if job.cancelled else
                             '操作完成' if value == 0 else f'操作未完成（退出码 {value}），请查看下方日志')
-            if (value == 0 or (action == 'list' and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import'):
+            if (value == 0 or (action == 'list' and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure'):
                 try:
                     payload = job.payload
+                    if payload is None:
+                        raise ValueError(job.failures[0]['action'] if job.failures else '后台未返回结果')
                     if action == 'scan':
                         for item in self.devices.values():
                             item['nearby'] = False
@@ -183,19 +185,26 @@ class Terminal:
                             self.devices[key] = {**self.devices.get(key, {}), **item}
                         failures = sum(bool(item.get('error')) for item in payload)
                         self.message = (f'{failures} 个档案校验或入库失败，请查看选中设备及日志' if failures else
-                                        self.refresh_message or f'已校验 {len(payload)} 个设备并入库 · s 扫描 · Enter 下载')
+                                        self.refresh_message or f'已读取 {len(payload)} 个设备 · s 扫描 · Enter 下载')
                         self.refresh_message = None
                     elif action == 'records':
                         self.preview, self.preview_offset = list(reversed(payload)), 0
                     elif action == 'backup':
                         self.message = f'数据库备份完成：{payload["backup"]}（按 l 查看完整路径）'
+                    elif action == 'migrate':
+                        self.message = f'迁移完成：{payload["records"]} 条，旧材料保留在 legacy/（按 l 查看详情）'
+                    elif action == 'configure':
+                        from .manager import Library
+                        self.library = Library(payload['data_dir'])
+                        self.devices = {}
+                        self.message = '数据位置已保存；已有数据未搬动'
                     elif action == 'export':
                         self.message = f'已导出 {payload["rows"]} 条：{payload["output"]}（按 l 查看完整路径）'
                     else:
-                        self.message = f'已导入完整档案：{payload["csv"]}（按 l 查看完整路径）'
+                        self.message = f'已导入完整档案：{payload["database"]}（按 l 查看完整路径）'
                 except (ValueError, TypeError, KeyError) as exc:
                     self.message = f'无法读取任务结果：{exc}'
-            if action in ('download', 'import'):
+            if action in ('download', 'import', 'migrate', 'configure'):
                 self.refresh_message = self.message
                 self.start('list', ['list'])
             if action == 'download' or (value and action != 'list'):
@@ -223,7 +232,7 @@ class Terminal:
                              f'预计剩余 {TransferProgress.duration(event["eta"])}')
         elif kind == 'result':
             self.job.payload = event['data']
-            if self.action in ('export', 'backup', 'import'):
+            if self.action in ('export', 'backup', 'import', 'migrate', 'configure'):
                 self.logs.append('结果：' + json.dumps(event['data'], ensure_ascii=False))
         elif kind == 'completed':
             self.job.outcomes.append(event)
@@ -256,6 +265,10 @@ class Terminal:
                 if not values[0]:
                     raise ValueError('请输入 CSV 路径')
                 self.start('import', ['import', values[0]] + (['--metadata', values[1]] if values[1] else []))
+            elif action == 'configure':
+                if not values[0]:
+                    raise ValueError('请输入数据目录')
+                self.start('configure', ['configure', values[0]])
             elif action == 'export':
                 if not values[0]:
                     raise ValueError('请输入导出路径')
@@ -343,10 +356,11 @@ class Terminal:
                     'n 手动输入序列号；未命名候选设备可同时指定 BLE UUID。',
                     'i 导入原始完整 CSV 与 .csv.json，源文件保留。',
                     'v 从 SQLite 预览最新记录；e 导出 CSV，支持起止时间筛选。',
-                    'b 备份数据库到 archive/backups/。继续下载还需要保留整个 archive。',
-                    'r 校验并刷新本地档案；l 查看日志，↑↓ / PgUp / PgDn 滚动。',
-                    '首次下载中断：保留在 .downloads/，下次重新读取完整历史。',
-                    '增量下载中断：保留 pending 数据，下次从绝对游标恢复。',
+                    'b 备份数据库到数据目录/backups/，包括下载恢复进度。',
+                    'm 迁移旧档案，先备份核验；p 保存数据位置（不搬动已有数据）；o 打开文件夹。',
+                    'r 只读刷新本地档案；l 查看日志，↑↓ / PgUp / PgDn 滚动。',
+                    '首次下载中断：保留在数据库，下次重新读取完整历史。',
+                    '增量下载中断：数据库保留待确认块，下次从绝对游标恢复。',
                     '只支持 DROP D3。下载前断开手机 LiNK，确保电脑蓝牙权限已启用。',
                     '设备时间没有时区；结束日期只写日期时包含当天整天。',
                 ]
@@ -368,7 +382,17 @@ class Terminal:
             self.selected = max(0, self.selected - 1)
         elif not self.job:
             device = self.selected_device()
-            if key == 's':
+            if key == 'm':
+                self.start('migrate', ['migrate'])
+            elif key == 'p':
+                self.open_form('保存数据位置（不搬动已有数据；新位置可以为空）', [('数据目录', str(self.library.root))], 'configure')
+            elif key == 'o':
+                if self.library.root.exists():
+                    subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', str(self.library.root)])
+                    self.message = f'已打开：{self.library.root}'
+                else:
+                    self.message = '尚未建立数据目录；首次下载后即可打开'
+            elif key == 's':
                 self.start('scan', ['scan'])
             elif key == 'r':
                 self.start('list', ['list'])
@@ -441,7 +465,7 @@ class Terminal:
         for number, line in enumerate(list(self.logs)[-max(1, height - log_start - 3):]):
             self.put(log_start + number, line, curses.A_DIM)
         self.put(height - 2, '↑↓ 选择  Enter/d 下载  s 扫描  r 刷新  n 添加  i 导入  v 记录  e 导出')
-        self.put(height - 1, 'a 同步全部  b 备份  c 取消  l 日志  ? 帮助  q 退出', curses.A_DIM)
+        self.put(height - 1, 'a 全部  b 备份  m 迁移  p 位置  o 文件夹  c 取消  l 日志  ? 帮助  q 退出', curses.A_DIM)
         if self.preview is not None:
             self.screen.erase()
             self.put(0, '最近 100 条记录 · ↑↓ 滚动 · Esc/q 返回 · 时间为设备本地时间', curses.A_BOLD)

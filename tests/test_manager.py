@@ -114,30 +114,30 @@ class LibraryTests(unittest.TestCase):
 
     def test_first_download_then_incremental_is_one_archive(self):
         self.assertEqual(self.download(FakeBLE([record(20), record(25)], 102)), 0)
-        initial = self.library.path('2866855')
+        initial = self.library.database_path
         self.assertEqual(self.library.status()[0]['next_cursor'], 102)
         fake = FakeBLE([record(30)], 103)
         self.assertEqual(self.download(fake), 0)
         query = next(f for f in fake.writes if f.kind == 0 and f.payload[:2] == b'\x03\x00')
         self.assertEqual(int.from_bytes(query.payload[2:6], 'little'), 102)
-        self.assertEqual(self.library.path('2866855'), initial)
+        self.assertEqual(self.library.database_path, initial)
         self.assertEqual(len(self.library.records('2866855')), 3)
         self.assertFalse(list(self.library.root.rglob('*.partial.csv')))
 
-    def test_cancel_first_download_preserves_spool_and_retry_restarts(self):
+    def test_cancel_first_download_preserves_blocks_and_retry_restarts(self):
         fake = FakeBLE([record(20)], 101, interrupt=True)
-        with self.assertRaises(asyncio.CancelledError):
-            self.download(fake)
+        with self.assertRaises(asyncio.CancelledError): self.download(fake)
         self.assertTrue(fake.stopped)
-        attempts = self.library.attempts('2866855')
-        self.assertEqual(len(attempts), 1)
-        _, rows = protocol._rows_checked(attempts[0])
-        self.assertEqual(rows[0]['record_hex'], record(20).hex())
         self.assertFalse(self.library.archives())
         self.assertEqual(self.library.status()[0]['initial_attempts'], 1)
-        self.download(FakeBLE([record(20), record(25)], 102))
+        self.assertEqual(self.library.status()[0]['pending_records'], 1)
+        retry = FakeBLE([record(20), record(25)], 102)
+        self.download(retry)
+        query = next(f for f in retry.writes if f.kind == 0 and f.payload[:2] == b'\x03\x00')
+        self.assertEqual(int.from_bytes(query.payload[2:6], 'little'), 0)
         self.assertEqual(len(self.library.records('2866855')), 2)
-        self.assertTrue(attempts[0].exists())
+        with self.library.store.connect() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM pending_blocks').fetchone()[0], 0)
 
     def test_cancel_incremental_then_resume_absolute_cursor(self):
         self.library.import_archive(self.fixture())
@@ -148,13 +148,11 @@ class LibraryTests(unittest.TestCase):
         self.download(FakeBLE([record(35)], 105))
         self.assertEqual(len(self.library.records('2866855')), 5)
 
-    def test_completed_first_download_recovers_without_ble(self):
-        with patch.object(self.library, '_publish', side_effect=OSError('crash before publication')):
-            with self.assertRaises(OSError):
-                self.download(FakeBLE([record(20)], 101))
-        with patch.object(protocol, 'live_read', side_effect=AssertionError('must not use BLE')):
-            self.assertEqual(asyncio.run(self.library.download('2866855', execute=True)), 0)
-        self.assertEqual(self.library.status()[0]['committed_records'], 1)
+    def test_completed_first_download_is_immediately_queryable(self):
+        self.download(FakeBLE([record(20)], 101))
+        reopened = manager.Library(self.library.root)
+        self.assertEqual(len(reopened.records('2866855')), 1)
+        self.assertEqual(reopened.status()[0]['next_cursor'], 101)
 
     def test_wrong_device_never_receives_commands(self):
         fake = FakeBLE([record(20)], 101, serial='0000')
@@ -162,6 +160,19 @@ class LibraryTests(unittest.TestCase):
             self.download(fake)
         self.assertEqual(fake.writes, [])
         self.assertFalse(self.library.archives())
+
+    def test_d1_and_d2_models_rejected_before_any_proprietary_write(self):
+        for model in (b'Kestrel DROP 1',b'Kestrel DROP 2'):
+            with self.subTest(model=model):
+                fake=FakeBLE([record(20)],101)
+                original=fake.module.BleakClient
+                class Client(original):
+                    async def read_gatt_char(self,uuid):
+                        return b'2866855' if uuid==protocol.SERIAL_UUID else model
+                fake.module.BleakClient=Client
+                with self.assertRaisesRegex(RuntimeError,'unsupported model'): self.download(fake)
+                self.assertEqual(fake.writes,[])
+                self.assertFalse(self.library.archives())
 
     def test_empty_device_does_not_publish_empty_archive(self):
         self.download(FakeBLE([], 0))
@@ -172,7 +183,9 @@ class LibraryTests(unittest.TestCase):
         original = source.read_bytes()
         output = self.library.import_archive(source)
         self.assertEqual(source.read_bytes(), original)
-        self.assertEqual(output.read_bytes(), original)
+        self.assertEqual(output, self.library.database_path)
+        self.assertFalse(list(self.library.root.rglob('*.csv')))
+        self.assertEqual(len(self.library.records('2866855')), 3)
         with self.assertRaises(FileExistsError):
             self.library.import_archive(source)
 
@@ -189,7 +202,7 @@ class LibraryTests(unittest.TestCase):
     def test_incremental_ble_disconnect_becomes_actionable_error(self):
         self.library.import_archive(self.fixture())
         fake = FakeBLE([], 0)
-        with fake.patches(), patch.object(protocol, 'sync_live', side_effect=fake.errors.BleakError('connection rejected')):
+        with fake.patches(), patch.object(protocol, 'resolve_ble_device', side_effect=fake.errors.BleakError('connection rejected')):
             with self.assertRaisesRegex(RuntimeError, '蓝牙操作失败.*connection rejected'):
                 asyncio.run(self.library.download('2866855', execute=True))
 
@@ -221,14 +234,31 @@ class LibraryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.library.export('2866855', self.root / 'bad.csv', since='2026-10-23', until='2026-10-22')
 
-    def test_status_respects_active_writer(self):
-        output = self.library.import_archive(self.fixture())
-        with protocol._archive_lock(output):
-            self.assertIn('Another download', self.library.status()[0]['error'])
+    def test_status_reads_while_writer_lock_held(self):
+        from kestrel_drop.storage import writer_lock
+        self.library.import_archive(self.fixture())
+        with writer_lock(self.library.root):
+            self.assertEqual(self.library.status()[0]['database_records'], 3)
 
     def test_dry_run_never_creates_library(self):
         self.assertEqual(asyncio.run(self.library.download('2866855')), 0)
         self.assertFalse(self.library.root.exists())
+
+    def test_explicit_directory_and_configure_can_recover_bad_settings(self):
+        settings=self.root/'settings.json'
+        settings.write_text('broken JSON')
+        with patch.dict('os.environ',{'KESTREL_CONFIG_FILE':str(settings)}):
+            self.assertEqual(manager.main(['--data-dir',str(self.library.root),'list']),0)
+            self.assertEqual(manager.main(['configure',str(self.root/'chosen')]),0)
+            self.assertEqual(json.loads(settings.read_text())['data_dir'],str((self.root/'chosen').resolve()))
+
+    def test_export_write_failure_does_not_publish_partial_file(self):
+        self.library.import_archive(self.fixture())
+        destination=self.root/'export.csv'
+        with patch('kestrel_drop.manager.os.fsync',side_effect=OSError('disk full')):
+            with self.assertRaises(OSError): self.library.export('2866855',destination)
+        self.assertFalse(destination.exists())
+        self.assertFalse(list(self.root.glob('.kestrel-export-*')))
 
     def test_serial_path_traversal_rejected(self):
         for value in ('../source', '', '1/2', '１２３', '-1'):

@@ -2,7 +2,7 @@
 
 从项目根目录运行本文命令。日常下载管理请使用[主入口](../README.md)。本文保留协议实现与验证背景；历史测试数量及现场验证描述对应 0.2.0。
 
-0.4.0 增加了 [SQLite 查询账本](storage.md)。本文底层 `sync` / `adopt` 命令只维护 CSV 恢复档案；使用统一入口下载会自动入库，单独运行底层工具后可用 `uv run kestrel.py db` 补入库。
+0.6.0 日常入口已改为 [SQLite 唯一运行存储](storage.md)。本文的 `sync` / `adopt` 等命令维护旧 CSV 格式，仅用于协议研究与旧档案诊断；它们不会更新新版数据库。旧档案请通过统一入口的 `migrate` 迁移。
 
 
 **Experimental reverse-engineered implementation, 2026-10-22.** This release builds on the previous `kestrel_protocol.py` and adds durable CSV spooling, cross-session incremental download by **absolute record cursor**, and verified publication. D3 only; D2 record format is not yet verified. It **never sends a clear-log command**, but it does use experimental BLE GATT writes when `--execute` is provided. Back up your data via Kestrel LiNK before first use.

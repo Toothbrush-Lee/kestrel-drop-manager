@@ -116,7 +116,11 @@ class ArchiveFixture(unittest.TestCase):
             'serial': '2866855', 'model': 'Kestrel DROP 3', 'rows': 1,
             'first_record_time': row['timestamp_device_local'], 'last_record_time': row['timestamp_device_local'],
             'validation': {'next_cursor': 101, 'inferred_first_cursor': 100}}))
-        self.output = self.library.import_archive(source)
+        self.output = self.root / 'legacy.csv'
+        import shutil
+        shutil.copyfile(source, self.output)
+        protocol.adopt_archive(self.output, Path(str(source) + '.json'))
+        self.source = source
         self.paths = protocol._archive_paths(self.output)
         self.state = protocol._state_loaded(self.paths)
 
@@ -174,7 +178,7 @@ class CheckpointTests(ArchiveFixture):
         async def resolve(_): return object()
         with fake.patches(), patch.object(protocol, 'resolve_ble_device', resolve), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             with self.assertRaises(asyncio.CancelledError):
-                asyncio.run(self.library.download('2866855', execute=True))
+                asyncio.run(protocol.sync_live(type('Args', (), dict(output=str(self.output), serial='2866855', execute=True, ble_id=None, scan_timeout=1, maxrows=100, progress_factory=protocol.TransferProgress))()))
         self.assertEqual(verified, [True])
 
     def test_checkpoint_write_failure_preserves_tail_and_resumes_only_verified_prefix(self):
@@ -258,12 +262,16 @@ with p._archive_lock(output):
 
 
 class EventTests(ArchiveFixture):
+    def setUp(self):
+        super().setUp()
+        self.library.import_archive(self.source)
+
     def test_success_stream_has_typed_phases_progress_and_complete_result(self):
         code, stream = self.run_cli(['download', '--serial', '2866855', '--execute'], FakeBLE([record(25)], 102))
         self.assertEqual(code, 0)
         self.assertTrue(all(item['version'] == 1 for item in stream))
         phases = [item['phase'] for item in stream if item['event'] == 'phase']
-        for phase in ('scanning', 'connecting', 'identifying', 'querying', 'receiving', 'verifying', 'saving', 'indexing'):
+        for phase in ('scanning', 'connecting', 'identifying', 'querying', 'receiving', 'verifying', 'saving'):
             self.assertIn(phase, phases)
         self.assertTrue(any(item['event'] == 'progress' for item in stream))
         completed = next(item for item in stream if item['event'] == 'completed')
@@ -284,7 +292,8 @@ class EventTests(ArchiveFixture):
         self.assertEqual((code, result['status'], result['added_records']), (0, 'up_to_date', 0))
 
     def test_unconfirmed_completion_is_actionable_and_not_success(self):
-        self.append(self.spool())
+        transfer = self.library.store.begin_transfer('2866855', 101, 1)
+        self.library.store.append_block(transfer, [protocol.decode_record(record(25), block=0, position=0)], [{'block': 0, 'records': 1}])
         code, stream = self.run_cli(['download', '--serial', '2866855', '--execute'], FakeBLE([], 102))
         failure = next(item for item in stream if item['event'] == 'error')
         self.assertEqual((code, failure['code']), (2, 'completion_pending'))
@@ -389,6 +398,20 @@ class ResultInteractionTests(unittest.TestCase):
         with patch.object(terminal, 'start') as start:
             terminal.handle('v')
             start.assert_called_once_with('records', ['records', '123', '--limit', '100'])
+
+    def test_migration_and_location_are_available_from_main_screen(self):
+        terminal=self.terminal(); terminal.result_view=None
+        with patch.object(terminal,'start') as start:
+            terminal.handle('m'); start.assert_called_once_with('migrate',['migrate'])
+        terminal.handle('p')
+        self.assertEqual(terminal.form['action'],'configure')
+        self.assertEqual(terminal.form['fields'][0][1],str(terminal.library.root))
+
+    def test_open_directory_uses_argument_list(self):
+        terminal=self.terminal(); terminal.result_view=None
+        with patch('kestrel_drop.tui.subprocess.Popen') as launch, patch.object(Path,'exists',return_value=True):
+            terminal.handle('o')
+            self.assertEqual(launch.call_args.args[0][1],str(terminal.library.root))
 
     def test_log_text_cannot_forge_progress(self):
         terminal = self.terminal()

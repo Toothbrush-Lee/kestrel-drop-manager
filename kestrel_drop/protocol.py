@@ -518,7 +518,7 @@ class BleSession:
             raise RuntimeError(f'Unexpected response during query: {fr.to_json()}')
 
     async def download_from_cursor(self,cursor:int,expected:int,maxrows:int,
-                                   progress: TransferProgress | None = None, on_block=None):
+                                   progress: TransferProgress | None = None, on_block=None, on_complete=None):
         await self.send(0,(5).to_bytes(2,'little')+cursor.to_bytes(4,'little')+b'\x00'*4)
         rows=[];blocks=[];next_cursor=None
         seen=set()
@@ -556,6 +556,9 @@ class BleSession:
                 next_cursor=int.from_bytes(frame.payload[2:6],'little')
                 if not rows or len(rows) < expected or (cursor != 0 and next_cursor != cursor + len(rows)) or next_cursor < len(rows):
                     raise TransferError('Invalid or incomplete final completion cursor; nothing published')
+                if on_complete is not None:
+                    # Native storage publishes completion durably before ACK too.
+                    on_complete(rows, blocks, next_cursor)
                 await self.ack(18)
                 break
             raise TransferError('Unexpected frame while reading logs: '+str(frame.to_json()))

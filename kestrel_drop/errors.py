@@ -7,13 +7,18 @@ TITLES = {'operation_failed': '操作未完成', 'transfer_integrity': '传输�
           'not_found': '未找到文件或设备档案', 'invalid_input': '输入内容需要检查',
           'dependency_missing': '运行依赖尚未准备好', 'busy': '另一个任务正在使用档案',
           'storage_failed': '保存数据时发生错误', 'archive_check_failed': '档案校验未通过',
-          'completion_pending': '等待设备完成确认', 'worker_failed': '后台任务未正常完成'}
+          'completion_pending': '等待设备完成确认', 'worker_failed': '后台任务未正常完成', 'migration_required': '旧档案需要迁移'}
 
 
 class AppError(RuntimeError):
     code = 'operation_failed'
     retryable = False
     action = '查看日志并保留档案文件；不要覆盖已有数据。'
+
+
+class MigrationRequired(AppError):
+    code = 'migration_required'
+    action = '在主界面按 m，或运行 migrate；软件会先备份并核验旧档案。'
 
 
 class TransferError(AppError):
@@ -51,6 +56,6 @@ def describe(error):
     elif isinstance(error, (sqlite3.Error, OSError)):
         code, retryable, action = 'storage_failed', False, '检查磁盘空间和目录权限，保留完整档案后再重试。'
     else:
-        code, retryable, action = 'archive_check_failed', False, '保留 CSV、JSON 和数据库，查看日志；不要手动修改游标或覆盖文件。'
+        code, retryable, action = 'archive_check_failed', False, '保留数据库与 legacy 旧档案，查看日志；不要手动修改游标或覆盖文件。'
     return {'code': code, 'title': TITLES.get(code, '操作未完成'), 'message': str(error) or '操作被中断',
             'retryable': retryable, 'action': action}
