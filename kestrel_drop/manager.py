@@ -14,11 +14,14 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import sys
 from types import SimpleNamespace
 import uuid
 
 from . import protocol
 from .database import Store
+from . import events
+from .errors import BluetoothFailure, describe
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / 'archive'
 DROP_SERVICE = '12630000-cc25-497d-9854-9b6c02c77054'
@@ -29,7 +32,7 @@ async def _ble_call(operation, *args, **kwargs):
     try:
         return await operation(*args, **kwargs)
     except BleakError as exc:
-        raise RuntimeError(f'蓝牙操作失败：{exc}。请断开手机 LiNK，检查蓝牙开关和终端权限，然后重试。') from exc
+        raise BluetoothFailure(f'蓝牙操作失败：{exc}。请断开手机 LiNK，检查蓝牙开关和终端权限，然后重试。') from exc
 
 
 def serial_number(value: str) -> str:
@@ -43,6 +46,7 @@ async def discover(timeout: float = 15) -> list[dict]:
     if timeout <= 0:
         raise ValueError('扫描时间必须大于 0')
     from bleak import BleakScanner
+    events.emit('phase', phase='scanning')
     found = await _ble_call(BleakScanner.discover, timeout=timeout, return_adv=True)
     devices = []
     for device, adv in found.values():
@@ -62,6 +66,22 @@ class Library:
         self.root = Path(root).expanduser().resolve()
         self.database_path = self.root / 'library.sqlite'
         self._store = None
+        self.download_results = {}
+
+    def complete_download(self, serial, previous=0, code=0):
+        if serial in self.archives():
+            info = self.index_archive(serial)
+            device = self.store.device(serial)
+            outcome = {'serial': serial, 'status': 'pending' if code else 'downloaded' if info['committed_records'] > previous else 'up_to_date',
+                       'added_records': info['committed_records'] - previous, 'total_records': info['committed_records'],
+                       'pending_records': info['pending_records'], 'first_timestamp': device['first_timestamp'],
+                       'last_timestamp': device['last_timestamp'], 'code': code}
+        else:
+            outcome = {'serial': serial, 'status': 'empty', 'added_records': 0, 'total_records': 0,
+                       'pending_records': 0, 'code': code}
+        self.download_results[serial] = outcome
+        events.emit('completed', **outcome)
+        return code
 
     @property
     def store(self) -> Store:
@@ -72,10 +92,12 @@ class Library:
     def index_archive(self, serial: str) -> dict:
         """Replay committed CSV into SQLite while holding the transport lock."""
         output = self.path(serial)
+        events.emit('phase', serial=serial, phase='archive_check')
         with protocol._archive_lock(output):
             info = protocol._archive_info_locked(output)
             state = protocol._state_loaded(protocol._archive_paths(output))
             names, rows = protocol._rows_checked(output)
+            events.emit('phase', serial=serial, phase='indexing')
             info.update(self.store.ingest(output, state, names, rows))
         return info
 
@@ -198,11 +220,10 @@ class Library:
                                    scan_timeout=timeout, maxrows=maxrows)
             args.progress_factory = progress_factory or (lambda count: protocol.TransferProgress(count, log_seconds=0.5))
             if serial in archives:
-                self.index_archive(serial)
+                before = self.index_archive(serial)['committed_records']
                 args.output = str(archives[serial])
                 result = await _ble_call(protocol.sync_live, args)
-                self.index_archive(serial)
-                return result
+                return self.complete_download(serial, previous=before, code=result)
             if self.database_path.exists():
                 if any(item['serial'] == serial for item in self.store.summary()['devices']):
                     raise RuntimeError('数据库中已有该设备，但缺少下载恢复档案。请恢复整个 archive 备份后再同步。')
@@ -211,7 +232,7 @@ class Library:
             for candidate in sorted((self.root / '.downloads' / serial).glob('*/history.csv')):
                 if Path(str(candidate) + '.json').exists():
                     print(f'恢复已完成的首次下载：{self._publish(serial, candidate)}')
-                    return 0
+                    return self.complete_download(serial)
             attempts = self.attempts(serial)
             if attempts:
                 print(f'保留 {len(attempts)} 份首次下载中断数据。绝对起始游标尚未确认，本次重新读取完整历史。')
@@ -222,7 +243,7 @@ class Library:
                 print(f'档案已建立：{self._publish(serial, output)}')
             else:
                 print('设备没有可下载记录；尚未建立档案。')
-            return result
+            return self.complete_download(serial, code=result)
 
     def records(self, serial: str, limit=30) -> list[dict]:
         if limit < 1:
@@ -258,6 +279,7 @@ def parser():
     import argparse
     ap = argparse.ArgumentParser(description='Kestrel DROP D3 一站式下载管理（默认打开中文 TUI）')
     ap.add_argument('--data-dir', default=str(DEFAULT_ROOT), help='档案目录，默认项目 archive/')
+    ap.add_argument('--events-json', action='store_true', help='输出版本化 JSON Lines 事件，供 TUI / 自动化使用')
     sub = ap.add_subparsers(dest='command')
     sub.add_parser('tui', help='交互式终端界面')
     scan = sub.add_parser('scan', help='扫描附近 DROP，不连接或写入设备')
@@ -292,9 +314,20 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.events_json:
+        with events.stream(sys.stdout):
+            code = _run(args)
+            events.emit('finished', code=code)
+            return code
+    return _run(args)
+
+
+def _run(args):
     library = Library(args.data_dir)
     try:
         if args.command in (None, 'tui'):
+            if args.events_json:
+                raise ValueError('--events-json 仅供非交互子命令使用；打开 TUI 请移除此选项')
             from .tui import run
             return run(library)
         if args.command == 'scan':
@@ -307,7 +340,10 @@ def main(argv=None):
                     raise FileNotFoundError(f'设备 {args.serial} 尚无档案')
                 result = matches[0]
             if (isinstance(result, dict) and result.get('error')) or (isinstance(result, list) and any(item.get('error') for item in result)):
-                print(json.dumps(result, ensure_ascii=False, indent=2))
+                for item in result if isinstance(result, list) else [result]:
+                    if item.get('error'):
+                        events.emit('error', serial=item['serial'], **describe(RuntimeError(item['error'])))
+                events.result(result)
                 return 2
         elif args.command == 'db':
             result = library.database_info()
@@ -327,26 +363,36 @@ def main(argv=None):
             if not serials:
                 raise ValueError('没有本地档案；先 scan，再使用 download --serial 建立档案')
             failures = []
+            outcomes = []
             async def batch():
                 for serial in serials:
                     try:
-                        code = await library.download(serial, execute=args.execute, ble_id=args.ble_id,
-                                                      timeout=args.timeout, maxrows=args.maxrows)
+                        with events.context(serial=serial):
+                            code = await library.download(serial, execute=args.execute, ble_id=args.ble_id,
+                                                          timeout=args.timeout, maxrows=args.maxrows)
+                        outcomes.append(library.download_results.get(serial, {'serial': serial, 'code': code, 'status': 'dry_run'}))
                         if code:
                             failures.append({'serial': serial, 'code': code})
+                            events.emit('error', serial=serial, code='completion_pending', retryable=True,
+                                        message='部分暂存数据缺少设备完成确认，尚未发布。', action='等待设备产生新样本后重试，保留 pending 文件。')
                     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
-                        failures.append({'serial': serial, 'error': str(exc)})
+                        failure = {'serial': serial, **describe(exc)}
+                        failures.append(failure)
+                        outcomes.append({'serial': serial, 'status': 'failed', 'error': failure})
+                        events.emit('error', **failure)
                         print(f'设备 {serial} 失败：{exc}', file=__import__('sys').stderr)
             asyncio.run(batch())
+            events.result({'downloads': outcomes, 'incomplete': failures})
             if failures:
-                print(json.dumps({'incomplete': failures}, ensure_ascii=False, indent=2))
                 return 2
             return 0
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        events.result(result)
         return 0
     except KeyboardInterrupt:
+        events.emit('error', **describe(KeyboardInterrupt()))
         print('\n已取消；已落盘的数据会保留。', file=__import__('sys').stderr)
         return 130
     except (OSError, RuntimeError, ValueError, KeyError, ImportError, sqlite3.Error) as exc:
+        events.emit('error', **describe(exc))
         print(f'错误：{exc}', file=__import__('sys').stderr)
         return 2

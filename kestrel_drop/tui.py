@@ -18,6 +18,15 @@ import threading
 import time
 import unicodedata
 
+from .protocol import TransferProgress
+from .errors import TITLES
+
+PHASES = {'scanning': '扫描附近设备', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
+          'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
+          'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库'}
+STATUSES = {'downloaded': '已保存', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
+            'empty': '设备暂无记录', 'failed': '未完成', 'dry_run': '仅预演'}
+
 
 def clip(text, width):
     """Clip by terminal cells instead of splitting Chinese wide characters."""
@@ -36,11 +45,16 @@ def clip(text, width):
 class Job:
     def __init__(self, root, arguments):
         self.events = queue.Queue()
-        self.lines = []
         self.cancelled = False
+        self.arguments = list(arguments)
+        self.payload = None
+        self.failures = []
+        self.outcomes = []
+        self.protocol_error = False
+        self.finished = False
         self.process = subprocess.Popen(
             [sys.executable, '-u', str(Path(__file__).resolve().parents[1] / 'kestrel.py'),
-             '--data-dir', str(root), *arguments],
+             '--data-dir', str(root), '--events-json', *arguments],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding='utf-8', errors='replace', bufsize=1,
             env={**os.environ, 'PYTHONUNBUFFERED': '1'},
@@ -59,12 +73,22 @@ class Job:
         error_thread.start()
         try:
             for line in self.process.stdout:
-                self.events.put(('line', line.rstrip()))
+                try:
+                    event = json.loads(line)
+                    if not isinstance(event, dict) or event.get('version') != 1 or event.get('event') not in (
+                            'phase', 'progress', 'log', 'error', 'completed', 'result', 'finished'):
+                        raise ValueError('unknown event schema')
+                    if event['event'] == 'finished':
+                        self.finished = True
+                    self.events.put(('event', event))
+                except (ValueError, TypeError):
+                    self.protocol_error = True
+                    self.events.put(('stderr', '后台事件格式错误：' + line.rstrip()))
         finally:
             self.process.stdout.close()
             code = self.process.wait()
             error_thread.join()
-            self.events.put(('exit', code))
+            self.events.put(('exit', 2 if code == 0 and (self.protocol_error or not self.finished) else code))
 
     def cancel(self):
         if self.process.poll() is None:
@@ -105,6 +129,7 @@ class Terminal:
         self.refresh_message = None
         self.text_view = None
         self.text_offset = 0
+        self.result_view = None
 
     def start(self, action, arguments):
         if self.job:
@@ -125,21 +150,20 @@ class Terminal:
                 kind, value = self.job.events.get_nowait()
             except queue.Empty:
                 return
-            if kind in ('line', 'stderr'):
-                if kind == 'line':
-                    self.job.lines.append(value)
+            if kind == 'event':
+                self.receive_event(value)
+                continue
+            if kind == 'stderr':
                 self.logs.append(value)
-                if 'rec/s' in value:
-                    self.progress = value.strip()
                 continue
             job, action = self.job, self.action
             self.job = None
             self.action = None
             self.message = ('已取消；已落盘数据保留，可再次下载' if job.cancelled else
                             '操作完成' if value == 0 else f'操作未完成（退出码 {value}），请查看下方日志')
-            if (value == 0 or (action == 'list' and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export'):
+            if (value == 0 or (action == 'list' and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import'):
                 try:
-                    payload = json.loads('\n'.join(job.lines))
+                    payload = job.payload
                     if action == 'scan':
                         for item in self.devices.values():
                             item['nearby'] = False
@@ -165,14 +189,49 @@ class Terminal:
                         self.preview, self.preview_offset = list(reversed(payload)), 0
                     elif action == 'backup':
                         self.message = f'数据库备份完成：{payload["backup"]}（按 l 查看完整路径）'
-                    else:
+                    elif action == 'export':
                         self.message = f'已导出 {payload["rows"]} 条：{payload["output"]}（按 l 查看完整路径）'
+                    else:
+                        self.message = f'已导入完整档案：{payload["csv"]}（按 l 查看完整路径）'
                 except (ValueError, TypeError, KeyError) as exc:
                     self.message = f'无法读取任务结果：{exc}'
             if action in ('download', 'import'):
                 self.refresh_message = self.message
                 self.start('list', ['list'])
+            if action == 'download' or (value and action != 'list'):
+                outcomes = (job.payload or {}).get('downloads', job.outcomes) if isinstance(job.payload, dict) else job.outcomes
+                failures = job.failures or ([{'code': 'cancelled', 'message': '任务已取消，已落盘数据保留。',
+                                            'retryable': True, 'action': '可稍后重新下载。'}] if job.cancelled else [])
+                if value and not failures:
+                    failures = [{'code': 'worker_failed', 'message': '后台任务未完成。', 'retryable': False,
+                                 'action': '按 l 查看日志，检查后台启动或事件通信问题。'}]
+                self.result_view = {'outcomes': outcomes, 'failures': failures, 'code': value,
+                                    'action': action, 'arguments': job.arguments}
+                if len(outcomes) == 1 and outcomes[0]['serial'] in self.devices:
+                    self.selected = list(self.devices).index(outcomes[0]['serial'])
             return
+
+    def receive_event(self, event):
+        kind = event['event']
+        if kind == 'log':
+            self.logs.append(event['message'])
+        elif kind == 'phase':
+            self.message = f'{event.get("serial", "")} · {PHASES.get(event["phase"], event["phase"])}'
+        elif kind == 'progress':
+            self.progress = (f'{event["received"]:,}/{event["expected"]:,} 条  {event["rate"]:.1f} 条/秒  '
+                             f'已用 {TransferProgress.duration(event["elapsed"])}  '
+                             f'预计剩余 {TransferProgress.duration(event["eta"])}')
+        elif kind == 'result':
+            self.job.payload = event['data']
+            if self.action in ('export', 'backup', 'import'):
+                self.logs.append('结果：' + json.dumps(event['data'], ensure_ascii=False))
+        elif kind == 'completed':
+            self.job.outcomes.append(event)
+            self.logs.append(f'{event["serial"]}: {STATUSES.get(event["status"], event["status"])}，'
+                             f'新增 {event["added_records"]}，累计 {event["total_records"]}，未确认 {event["pending_records"]}')
+        elif kind == 'error':
+            self.job.failures.append(event)
+            self.logs.append(f'{event["code"]}: {event["message"]}；{event["action"]}')
 
     def selected_device(self):
         values = list(self.devices.values())
@@ -249,6 +308,20 @@ class Terminal:
                 self.preview_offset = min(max(0, len(self.preview) - 1), self.preview_offset + 1)
             elif key == curses.KEY_UP:
                 self.preview_offset = max(0, self.preview_offset - 1)
+            return True
+        if self.result_view is not None:
+            view = self.result_view
+            if key in ('\n', '\r', '\x1b', 'q'):
+                self.result_view = None
+            elif key == 'r' and any(failure.get('retryable') for failure in view['failures']):
+                if not self.job:
+                    self.result_view = None
+                    self.start(view['action'], view['arguments'])
+            elif key in ('v', 'e', 'b', 'l'):
+                if self.job:
+                    return True
+                self.result_view = None
+                return self.handle(key)
             return True
         if key in ('?', 'l'):
             if key == 'l':
@@ -391,7 +464,47 @@ class Terminal:
                 self.put(5 + index * 3, '> ' + value, curses.A_REVERSE if index == self.form['index'] else 0)
             self.put(height - 4, self.form['error'])
             self.put(height - 2, 'Tab / ↑↓ 切换字段 · Enter 下一项 / 提交 · Ctrl+U 清空 · Esc 返回')
+        if self.result_view is not None and self.text_view is None:
+            self.draw_result(height, width)
         self.screen.refresh()
+
+    def draw_result(self, height, width):
+        self.screen.erase()
+        view = self.result_view
+        self.put(1, '下载结果' if view['action'] == 'download' else '操作结果', curses.A_BOLD)
+        if view['outcomes']:
+            incomplete = sum(item['status'] in ('pending', 'failed') for item in view['outcomes'])
+            self.put(2, f'本次处理 {len(view["outcomes"])} 台设备 · 未完成 {incomplete} 台（完整明细见日志）')
+        row = 3
+        for item in view['outcomes'][:max(1, height - 12)]:
+            self.put(row, f'{item["serial"]} · {STATUSES.get(item["status"], item["status"])}', curses.A_BOLD)
+            row += 1
+            if item.get('status') != 'failed':
+                self.put(row, f'本次新增 {item.get("added_records", 0):,} 条 · 累计 {item.get("total_records", 0):,} 条 · 未确认 {item.get("pending_records", 0):,} 条')
+                row += 1
+                if len(view['outcomes']) == 1:
+                    self.put(row, f'时间范围：{item.get("first_timestamp") or "—"} 至 {item.get("last_timestamp") or "—"}')
+                    row += 2
+            if row >= height - 10:
+                break
+        if view['failures']:
+            failure = view['failures'][0]
+            self.put(row, failure.get('title') or TITLES.get(failure['code'], '操作未完成'), curses.A_BOLD)
+            row += 1
+            for text in (failure['action'],):
+                while text and row < height - 4:
+                    segment = clip(text, width - 3)
+                    self.put(row, segment)
+                    text = text[len(segment):]
+                    row += 1
+        elif not view['code']:
+            statuses = {item['status'] for item in view['outcomes']}
+            self.put(row, '设备暂无记录，尚未建立档案。' if statuses == {'empty'} else
+                     '本次仅预演，未访问蓝牙或建立档案。' if statuses == {'dry_run'} else
+                     '完整记录已验证保存。可以预览、导出或备份。')
+        self.put(height - 3, ('r 重试本次操作 · ' if any(item.get('retryable') for item in view['failures']) else '')
+                 + 'l 查看详情日志 · Enter 返回')
+        self.put(height - 2, 'v 查看已保存记录 · e 导出 CSV · b 数据库备份', curses.A_DIM)
 
     def loop(self):
         self.screen.timeout(100)

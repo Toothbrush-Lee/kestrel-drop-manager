@@ -46,7 +46,8 @@ class DatabaseTests(unittest.TestCase):
         state = protocol._state_loaded(paths)
         journal = protocol._new_pending(paths, state)
         protocol.BlockSpool(paths['pending'], state['fieldnames']).append(
-            [protocol.decode_record(record(30), block=0, position=0)], [])
+            [protocol.decode_record(record(30), block=0, position=0)], [{'block': 0, 'records': 1}])
+        journal.update(json.loads(paths['journal'].read_text()))
         journal['completed'] = {'next_cursor': 104, 'validation': {'verification': 'complete'}}
         protocol._json_atomic(paths['journal'], journal)
         protocol.commit_pending(paths, state)

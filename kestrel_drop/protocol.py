@@ -1,15 +1,16 @@
 """Kestrel DROP D3: verified offline decoder and experimental BLE history/sync client.
 
-The original full download succeeded on one user-owned D3. New incremental sync
-is validated through simulations, not yet field-tested on hardware.
+Full download and incremental sync have been exercised on a user-owned D3.
+Fault boundaries are additionally validated through deterministic simulations.
 Run: uv run scripts/kestrel_protocol.py --help
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import csv
+import io
 import hashlib
 import fcntl
 from contextlib import contextmanager
@@ -24,6 +25,10 @@ import time
 from pathlib import Path
 import struct
 import sys
+import uuid
+
+from .events import emit
+from .errors import TransferError, DeviceMismatch, BluetoothFailure
 
 SYNC = 0x7E
 ESC = 0x7D
@@ -238,21 +243,27 @@ def log_rows_from_frames(frames: list[Frame]) -> tuple[list[dict], list[dict]]:
     return rows,meta
 
 
-def read_official_csv(path: Path) -> tuple[dict,dict]:
+def read_official_csv(path: Path) -> tuple[dict,list]:
     with path.open(encoding='utf-8-sig',newline='') as f:
         original=list(csv.reader(f))
     if len(original)<5:raise ValueError('Not a Kestrel LiNK CSV')
     meta={r[0]:r[1] for r in original[:3] if len(r)>1}
     header=original[3]
-    result={}
+    result=[]
     for row in original[5:]:
         if len(row)<7 or not row[0].startswith('20'):continue
-        result[row[0]] = dict(zip(header,row))
+        result.append((row[0], dict(zip(header,row))))
     return meta,result
 
 
 def compare(rows, ref):
     matches=[]
+    # Consume each reference occurrence at most once, preserving file order.
+    reference = list(ref.items()) if isinstance(ref, dict) else list(ref)
+    occurrences = defaultdict(deque)
+    for index, (stamp, values) in enumerate(reference):
+        occurrences[stamp].append((index, values))
+    last_reference_index = -1
     fields=[('temperature_c','Temperature',0.051),
             ('relative_humidity_pct','Relative Humidity',0.051),
             ('station_pressure_hpa','Station Pressure',0.051),
@@ -265,15 +276,22 @@ def compare(rows, ref):
     result['fields']['density_altitude_m_official_integer_estimate']={'checked':0,'exact_display_matches':0}
     for row in rows:
         key=row['timestamp_device_local']
-        refrow=ref.get(key)
+        candidates = occurrences[key]
+        while candidates and candidates[0][0] <= last_reference_index:
+            candidates.popleft()
+        occurrence = candidates.popleft() if candidates else None
+        refrow = occurrence[1] if occurrence else None
         if refrow is None:
             result['missing_timestamps'].append(key)
             continue
         result['matched_timestamps']+=1
+        last_reference_index = occurrence[0]
         comparison={'timestamp':key}
         for field,label,tolerance in fields:
             source=refrow.get(label)
-            if not source:continue
+            if not source:
+                result['tolerance_failures'].append({'time': key, 'field': field, 'reason': 'reference value missing'})
+                continue
             diff=abs(row[field]-float(source))
             stat=result['fields'][field]
             stat['checked']+=1
@@ -431,6 +449,9 @@ class TransferProgress:
         extra = received - self.expected
         extra_label = f' (+{extra} new)' if extra > 0 else ''
         eta = (self.expected - received) / rate if rate > 0 and received < self.expected else None
+        if emit('progress', received=received, expected=self.expected, rate=rate,
+                elapsed=elapsed, eta=eta, status=status):
+            return
         if received >= self.expected and status == '':
             status = 'awaiting end'
         suffix = f' | {status}' if status else ''
@@ -472,10 +493,15 @@ class BleSession:
         await self.client.write_gatt_char(DOWN_UUID,encode_frame(kind,payload),response=True)
 
     async def next(self,timeout=25) -> Frame:
+        if self.parser.errors:
+            raise TransferError(f'Failed frame integrity: {self.parser.errors}')
         try:
-            return await asyncio.wait_for(self.queue.get(),timeout=timeout)
+            frame = await asyncio.wait_for(self.queue.get(),timeout=timeout)
         except asyncio.TimeoutError:
-            raise RuntimeError('Timed out waiting for next device frame') from None
+            raise BluetoothFailure('等待设备回复超时；已确认的连续记录已保留。') from None
+        if self.parser.errors:
+            raise TransferError(f'Failed frame integrity: {self.parser.errors}')
+        return frame
 
     async def ack(self,operation:int):
         await self.send(4,operation.to_bytes(2,'little'))
@@ -505,10 +531,19 @@ class BleSession:
                 # using opcode 05 before blocks are sent.
                 await self.ack(5)
                 continue
-            if frame.kind==3 and len(frame.payload)>=2 and (len(frame.payload)-2)%21==0:
-                new,meta=log_rows_from_frames([frame])
+            if frame.kind==3 and len(frame.payload)>2 and (len(frame.payload)-2)%RECORD_BYTES==0:
+                try:
+                    new,meta=log_rows_from_frames([frame])
+                    _check_order(new)
+                except (ValueError, RuntimeError) as exc:
+                    raise TransferError(f'Invalid record block: {exc}') from exc
                 seq=meta[0]['block']
-                if seq in seen:raise RuntimeError(f'Duplicate block {seq}')
+                if seq in seen:raise TransferError(f'Duplicate block {seq}')
+                # Observed D3 transfers start at zero, including absolute-cursor resumes.
+                if seq != len(blocks):
+                    raise TransferError(f'Missing or out-of-order log blocks: expected {len(blocks)}, got {seq}')
+                if rows and new[0]['timestamp_device_local'] < rows[-1]['timestamp_device_local']:
+                    raise TransferError('History timestamps go backwards between blocks')
                 if len(rows)+len(new)>maxrows:raise RuntimeError('Exceeded configured record limit')
                 if on_block is not None:
                     on_block(new, meta)  # durably persist this CRC-checked block BEFORE ACK
@@ -519,9 +554,11 @@ class BleSession:
                 continue
             if frame.kind==0 and len(frame.payload)>=6 and frame.payload[:2]==b'\x12\x00':
                 next_cursor=int.from_bytes(frame.payload[2:6],'little')
+                if not rows or len(rows) < expected or (cursor != 0 and next_cursor != cursor + len(rows)) or next_cursor < len(rows):
+                    raise TransferError('Invalid or incomplete final completion cursor; nothing published')
                 await self.ack(18)
                 break
-            raise RuntimeError('Unexpected frame while reading logs: '+str(frame.to_json()))
+            raise TransferError('Unexpected frame while reading logs: '+str(frame.to_json()))
         if self.parser.errors:raise RuntimeError(f'Failed frame integrity: {self.parser.errors}')
         # The device can continue logging while a long download is running.
         # Count from the preceding query is a snapshot, NOT a fixed transfer length.
@@ -640,6 +677,7 @@ async def resolve_ble_device(args):
     """
     from bleak import BleakScanner
 
+    emit('phase', serial=args.serial, phase='scanning')
     advertisements = await BleakScanner.discover(
         timeout=args.scan_timeout, return_adv=True
     )
@@ -669,7 +707,7 @@ async def resolve_ble_device(args):
                   for name, address, rssi in nearby
                   if name.lower().startswith(('d2', 'd3'))]
     details = '; '.join(near_drops[:8]) if near_drops else 'none'
-    raise RuntimeError(
+    raise BluetoothFailure(
         f"D3 serial {args.serial} not seen during a {args.scan_timeout:g}s "
         f"BLE scan ({len(nearby)} devices discovered; nearby DROP: {details}). "
         "Disconnect D3 in iPhone Kestrel LiNK and close the app, move the "
@@ -723,9 +761,8 @@ def _sha256(path: Path) -> str:
 
 
 def _json_atomic(path: Path, obj: dict) -> None:
-    temp = path.with_name(path.name + '.writing')
-    if temp.exists():
-        raise RuntimeError(f'Previous incomplete metadata write: {temp}. Inspect before retrying.')
+    # Unique staging names allow restart after a kill left an unpublished temp.
+    temp = path.with_name(path.name + '.writing-' + uuid.uuid4().hex)
     try:
         with temp.open('x', encoding='utf-8') as fd:
             json.dump(obj, fd, indent=2, ensure_ascii=False)
@@ -733,8 +770,17 @@ def _json_atomic(path: Path, obj: dict) -> None:
             fd.flush()
             os.fsync(fd.fileno())
         os.replace(temp, path)
+        _fsync_directory(path.parent)
     finally:
         temp.unlink(missing_ok=True)
+
+
+def _fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _rows_checked(path: Path) -> tuple[list[str], list[dict]]:
@@ -819,13 +865,57 @@ def _state_loaded(paths: dict) -> dict:
 def _pending_loaded(paths: dict, state: dict) -> tuple[dict | None, list[dict]]:
     if not paths['journal'].exists() and not paths['pending'].exists():
         return None, []
-    if not paths['journal'].exists() or not paths['pending'].exists():
-        raise RuntimeError('Only one of pending CSV/journal exists; preserve files for recovery, do not delete them')
+    expected_header = io.StringIO(newline='')
+    csv.DictWriter(expected_header, fieldnames=state['fieldnames']).writeheader()
+    header = expected_header.getvalue().encode('utf-8')
+    if not paths['journal'].exists():
+        if paths['pending'].read_bytes() != header:
+            raise RuntimeError('Only pending CSV exists without journal; preserve files, no cursor guessed')
+        # A kill between creating the empty spool and publishing its journal.
+        _json_atomic(paths['journal'], _pending_metadata(paths, state))
     journal = json.loads(paths['journal'].read_text(encoding='utf-8'))
     if (journal.get('serial'),journal.get('base_cursor'), journal.get('base_csv_sha256')) != (
          state['serial'],state['next_cursor'],state['csv_sha256']):
         raise RuntimeError('Pending transfer is from a different archive version/device; cannot resume')
+    if not paths['pending'].exists():
+        checkpoint = journal.get('spool_checkpoint') or {}
+        if (checkpoint.get('rows'), checkpoint.get('bytes'), checkpoint.get('sha256')) != (0, len(header), hashlib.sha256(header).hexdigest()):
+            raise RuntimeError('Pending CSV missing; preserve journal for recovery, nothing resumed')
+        with paths['pending'].open('xb') as fd:
+            fd.write(header); fd.flush(); os.fsync(fd.fileno())
+        _fsync_directory(paths['pending'].parent)
+    checkpoint = journal.get('spool_checkpoint')
+    if checkpoint:
+        content = paths['pending'].read_bytes()
+        boundary = checkpoint['bytes']
+        if boundary < 1 or len(content) < boundary or hashlib.sha256(content[:boundary]).hexdigest() != checkpoint['sha256']:
+            raise RuntimeError('Pending checkpoint failed integrity check; files preserved, nothing resumed')
+        if len(content) > boundary:
+            if journal.get('completed'):
+                raise RuntimeError('Completed pending checkpoint inconsistent; preserve files for inspection')
+            # Only the fsynced checkpoint was ACK-eligible. Preserve all extra
+            # bytes before returning to that known boundary, including torn rows.
+            evidence = paths['pending'].with_name(paths['pending'].name + '.unconfirmed-' + uuid.uuid4().hex + '.bin')
+            with evidence.open('xb') as fd:
+                fd.write(content[boundary:]); fd.flush(); os.fsync(fd.fileno())
+            _fsync_directory(evidence.parent)
+            with paths['pending'].open('r+b') as fd:
+                fd.truncate(boundary); fd.flush(); os.fsync(fd.fileno())
+            print(f'Recovered durable pending checkpoint; unconfirmed tail preserved at {evidence}', file=sys.stderr)
     names, rows = _rows_checked(paths['pending'])
+    if checkpoint and (checkpoint['rows'] != len(rows) or checkpoint['resume_cursor'] != state['next_cursor'] + len(rows)):
+        raise RuntimeError('Pending checkpoint row count/cursor inconsistent; refusing to resume')
+    if checkpoint:
+        offset = 0
+        for session in journal.get('transfer_sessions', []):
+            if (session['requested_cursor'] != state['next_cursor'] + offset or session['saved_records'] < 1
+                    or session['validated_blocks'] < 1 or session['last_block'] != session['validated_blocks'] - 1):
+                raise RuntimeError('Pending transfer session boundaries inconsistent; refusing to resume')
+            offset += session['saved_records']
+        if offset != len(rows):
+            raise RuntimeError('Pending rows lack verified transfer-session evidence; refusing to resume')
+    if rows and not checkpoint and not journal.get('completed'):
+        raise RuntimeError('Legacy pending transfer has no verified block checkpoint. Preserve it for independent validation; no cursor guessed.')
     if names != state['fieldnames']:
         raise RuntimeError('Pending CSV header differs from canonical archive')
     _check_order(rows)
@@ -835,37 +925,89 @@ def _pending_loaded(paths: dict, state: dict) -> tuple[dict | None, list[dict]]:
     return journal, rows
 
 
-def _new_pending(paths: dict, state: dict) -> dict:
-    if paths['pending'].exists() or paths['journal'].exists():
-        raise RuntimeError('Pending files already exist')
+def _pending_metadata(paths, state):
     journal = {'version': ARCHIVE_VERSION, 'serial':state['serial'],
                'base_cursor': state['next_cursor'],
                'base_csv_sha256': state['csv_sha256'],
                'base_last_time': state['last_record_time'],
-               'created_utc': datetime.now(timezone.utc).isoformat()}
+               'created_utc': datetime.now(timezone.utc).isoformat(),
+               'safety_version': 2, 'transfer_sessions': []}
+    journal['spool_checkpoint'] = {'bytes': paths['pending'].stat().st_size,
+                                   'sha256': _sha256(paths['pending']), 'rows': 0,
+                                   'resume_cursor': state['next_cursor']}
+    return journal
+
+
+def _new_pending(paths: dict, state: dict) -> dict:
+    if paths['pending'].exists() or paths['journal'].exists():
+        raise RuntimeError('Pending files already exist')
     with paths['pending'].open('x',encoding='utf-8',newline='') as f:
-        writer = csv.DictWriter(f,fieldnames=state['fieldnames'])
-        writer.writeheader()
+        csv.DictWriter(f,fieldnames=state['fieldnames']).writeheader()
         f.flush();os.fsync(f.fileno())
+    journal = _pending_metadata(paths, state)
     _json_atomic(paths['journal'],journal)
     return journal
 
 
 class BlockSpool:
-    def __init__(self,path: Path,names: list[str],existing: int = 0):
+    def __init__(self,path: Path,names: list[str],existing: int = 0, journal_path=None):
         self.path = path
         self.names = names
         self.count = existing
+        candidate = Path(str(path).removesuffix('.pending.csv') + '.pending.json')
+        self.journal_path = journal_path or (candidate if str(path).endswith('.pending.csv') and candidate.exists() else None)
+        self.digest = hashlib.sha256(path.read_bytes())
+        self.size = path.stat().st_size
+        self.session_id = uuid.uuid4().hex
+        self.session_rows = 0
+        self.session_blocks = 0
+        self.session_start = existing
+        _, saved = _rows_checked(path)
+        self.last_time = saved[-1]['timestamp_device_local'] if saved else None
+        if self.journal_path and self.last_time is None:
+            self.last_time = json.loads(Path(self.journal_path).read_text()).get('base_last_time')
 
     def append(self,rows: list[dict],_block_meta: list[dict]) -> None:
         # Every CRC-checked, decoded block is appended and fsynced BEFORE ACK.
         # A process interruption can therefore retain already received blocks.
-        with self.path.open('a',encoding='utf-8',newline='') as fd:
-            writer = csv.DictWriter(fd,fieldnames=self.names, extrasaction='ignore')
-            writer.writerows(rows)
+        if not rows or not _block_meta or sum(item['records'] for item in _block_meta) != len(rows):
+            raise TransferError('Invalid block record count; nothing written or acknowledged')
+        if [item['block'] for item in _block_meta] != list(range(self.session_blocks, self.session_blocks + len(_block_meta))):
+            raise TransferError('Missing, duplicate or out-of-order block at spool boundary')
+        _check_order(rows)
+        if self.last_time and rows[0]['timestamp_device_local'] < self.last_time:
+            raise TransferError('Incoming block precedes the durable archive boundary')
+        text = io.StringIO(newline='')
+        writer = csv.DictWriter(text, fieldnames=self.names, extrasaction='ignore')
+        writer.writerows(rows)
+        content = text.getvalue().encode('utf-8')
+        if self.path.stat().st_size != self.size:
+            raise RuntimeError('Pending spool changed independently; refusing to append')
+        with self.path.open('ab') as fd:
+            fd.write(content)
             fd.flush()
             os.fsync(fd.fileno())
         self.count += len(rows)
+        self.size += len(content)
+        self.digest.update(content)
+        self.last_time = rows[-1]['timestamp_device_local']
+        self.session_blocks += len(_block_meta)
+        self.session_rows += len(rows)
+        if self.journal_path:
+            journal = json.loads(Path(self.journal_path).read_text(encoding='utf-8'))
+            base = journal.get('base_cursor')
+            session = {'id': self.session_id, 'requested_cursor': base + self.session_start if base is not None else journal.get('requested_cursor'),
+                       'validated_blocks': self.session_blocks, 'saved_records': self.session_rows,
+                       'last_block': _block_meta[-1]['block'] if _block_meta else None}
+            sessions = journal.setdefault('transfer_sessions', [])
+            if sessions and sessions[-1]['id'] == self.session_id:
+                sessions[-1] = session
+            else:
+                sessions.append(session)
+            journal['safety_version'] = 2
+            journal['spool_checkpoint'] = {'bytes': self.size, 'sha256': self.digest.hexdigest(),
+                                           'rows': self.count, 'resume_cursor': base + self.count if base is not None else None}
+            _json_atomic(Path(self.journal_path), journal)  # checkpoint durable BEFORE ACK
 
 
 def _commit_state_from_completed(paths: dict, state: dict, journal: dict, pending: list[dict]):
@@ -932,6 +1074,21 @@ def _check_archive_or_recover(paths: dict, state: dict) -> dict:
     if not paths['csv'].exists():
         raise FileNotFoundError('Canonical CSV missing; no data changed')
     actual = _sha256(paths['csv'])
+    if actual == state['csv_sha256'] and paths['journal'].exists():
+        journal = json.loads(paths['journal'].read_text(encoding='utf-8'))
+        completed = journal.get('completed') or {}
+        if (journal.get('serial') == state['serial'] and completed.get('next_cursor') == state['next_cursor']
+                and completed.get('staged_sha256') == actual):
+            # State is already durable; a kill interrupted only journal cleanup.
+            if paths['pending'].exists():
+                _, pending = _rows_checked(paths['pending'])
+                _, committed = _rows_checked(paths['csv'])
+                if not pending or journal['base_cursor'] + len(pending) != state['next_cursor'] or pending != committed[-len(pending):]:
+                    raise RuntimeError('Completed cleanup journal differs from committed CSV; files preserved')
+                paths['pending'].unlink()
+            paths['journal'].unlink()
+            _fsync_directory(paths['csv'].parent)
+            return state
     if actual == state['csv_sha256']:
         journal,pending = _pending_loaded(paths,state)
         if journal and journal.get('completed'):
@@ -963,14 +1120,17 @@ async def _sync_live_locked(args):
           f'{len(already):,} pending rows, requesting from absolute cursor {resume:,}.')
     from bleak import BleakClient
     device = await resolve_ble_device(args)
+    emit('phase', serial=args.serial, phase='connecting')
     async with BleakClient(device,timeout=30) as client:
+        emit('phase', serial=args.serial, phase='identifying')
         serial=(await client.read_gatt_char(SERIAL_UUID)).decode('utf-8','replace').strip('\x00 ')
         model=(await client.read_gatt_char(MODEL_UUID)).decode('utf-8','replace').strip('\x00 ')
         if serial != state['serial'] or 'DROP 3' not in model.upper():
-            raise RuntimeError(f'Connected to an unexpected device: {serial} {model}. No command sent.')
+            raise DeviceMismatch(f'Connected to an unexpected device: {serial} {model}. No command sent.')
         session=BleSession(client)
         await client.start_notify(UP_UUID,session.callback)
         try:
+            emit('phase', serial=args.serial, phase='querying')
             count=await session.query_count(resume)
             print(f'D3 reports {count:,} new records available since cursor {resume:,}.')
             if not count:
@@ -990,9 +1150,11 @@ async def _sync_live_locked(args):
             progress=getattr(args, 'progress_factory', TransferProgress)(count)
             started=time.monotonic()
             try:
+                emit('phase', serial=args.serial, phase='receiving')
                 rows, blocks, next_cursor = await session.download_from_cursor(
                     resume,count,args.maxrows,progress=progress,on_block=spool.append)
                 elapsed=time.monotonic()-started
+                emit('phase', serial=args.serial, phase='verifying')
                 verification=verify_completed_transfer(
                     rows=rows, blocks=blocks, initial_count=count,
                     requested_cursor=resume, next_cursor=next_cursor,
@@ -1003,8 +1165,10 @@ async def _sync_live_locked(args):
                 if len(saved) != next_cursor - base:
                     raise RuntimeError('Pending row count inconsistent with absolute completion cursor')
                 _check_order(saved)
+                journal = json.loads(paths['journal'].read_text(encoding='utf-8'))
                 journal['completed'] = {'next_cursor':next_cursor,'validation':verification}
                 _json_atomic(paths['journal'],journal)
+                emit('phase', serial=args.serial, phase='saving')
                 new_state = commit_pending(paths,state)
                 progress.finish(success=True)
                 print(f'Incrementally synchronized {len(rows):,} new records; '
@@ -1059,10 +1223,11 @@ async def live_read(args):
     # Connecting from a macOS UUID string forces a second implicit discovery.
     device = await resolve_ble_device(args)
     try:
+        emit('phase', serial=args.serial, phase='connecting')
         async with BleakClient(device, timeout=30) as client:
             return await _read_connected_d3(client, args, output)
     except BleakError as exc:
-        raise RuntimeError(
+        raise BluetoothFailure(
             f"BLE connection lost or rejected after discovery: {exc}. "
             "Make sure LiNK on iPhone is disconnected and retry. "
             "No guarantee that any in-progress BLE operation completed."
@@ -1070,15 +1235,17 @@ async def live_read(args):
 
 
 async def _read_connected_d3(client, args, output):
+    emit('phase', serial=args.serial, phase='identifying')
     serial=(await client.read_gatt_char(SERIAL_UUID)).decode('utf-8','replace').strip('\x00 ')
     model=(await client.read_gatt_char(MODEL_UUID)).decode('utf-8','replace').strip('\x00 ')
     if serial!=args.serial:
-        raise RuntimeError(f'Serial mismatch: expected {args.serial}, connected {serial}. No command sent.')
+        raise DeviceMismatch(f'Serial mismatch: expected {args.serial}, connected {serial}. No command sent.')
     if 'DROP 3' not in model.upper():
-        raise RuntimeError(f'Unsupported or unexpected model {model!r}; this D3 parser is not valid for D2')
+        raise DeviceMismatch(f'Unsupported or unexpected model {model!r}; this D3 parser is not valid for D2')
     session=BleSession(client)
     await client.start_notify(UP_UUID,session.callback)
     try:
+        emit('phase', serial=args.serial, phase='querying')
         count=await session.query_count(args.cursor)
         print(f'Identified {model} serial={serial}, cursor={args.cursor}, device reports {count} remaining records')
         if args.cmd=='probe':
@@ -1092,9 +1259,10 @@ async def _read_connected_d3(client, args, output):
         transfer_start = time.monotonic()
         progress = getattr(args, 'progress_factory', TransferProgress)(count)
         partial = Path(str(output) + '.partial.csv') if output is not None else None
+        partial_journal = Path(str(output) + '.partial.json') if output is not None else None
         spool = None
         if partial is not None:
-            if partial.exists():
+            if partial.exists() or partial_journal.exists():
                 raise FileExistsError(f'Previous partial download retained at {partial}; use a new output path')
             # The schema comes from decoded records; create the spool on the first block.
             def persist_block(new, meta):
@@ -1103,15 +1271,20 @@ async def _read_connected_d3(client, args, output):
                     with partial.open('x', encoding='utf-8', newline='') as fd:
                         csv.DictWriter(fd, fieldnames=list(new[0])).writeheader()
                         fd.flush(); os.fsync(fd.fileno())
-                    spool = BlockSpool(partial, list(new[0]))
+                    _json_atomic(partial_journal, {'serial': serial, 'base_cursor': args.cursor or None,
+                                                  'requested_cursor': args.cursor, 'absolute_start_known': args.cursor != 0,
+                                                  'transfer_sessions': []})
+                    spool = BlockSpool(partial, list(new[0]), journal_path=partial_journal)
                 spool.append(new, meta)
         else:
             persist_block = None
         try:
+            emit('phase', serial=args.serial, phase='receiving')
             rows,blocks,new_cursor=await session.download_from_cursor(
                 args.cursor,count,args.maxrows,progress=progress,on_block=persist_block)
             elapsed_seconds = time.monotonic() - transfer_start
             progress.update(len(rows), force=True, status='verifying')
+            emit('phase', serial=args.serial, phase='verifying')
             validation = verify_completed_transfer(
                 rows=rows, blocks=blocks, initial_count=count,
                 requested_cursor=args.cursor, next_cursor=new_cursor,
@@ -1128,9 +1301,11 @@ async def _read_connected_d3(client, args, output):
                 _, saved = _rows_checked(partial)
                 if [r['record_hex'] for r in saved] != [r['record_hex'] for r in rows]:
                     raise RuntimeError('Durable first-download spool differs from received records')
+            emit('phase', serial=args.serial, phase='saving')
             publish_live_files(output,rows,metadata)
             if partial is not None:
                 partial.unlink()
+                partial_journal.unlink()
         except BaseException:
             progress.finish(success=False, partial_saved=bool(partial and partial.exists()))
             raise

@@ -249,15 +249,15 @@ class LibraryTests(unittest.TestCase):
     def test_tui_background_job_reads_json_and_exits(self):
         job = Job(self.library.root, ['list'])
         self.addCleanup(job.close)
-        lines = []
+        payloads = []
         while True:
             kind, value = job.events.get(timeout=10)
             if kind == 'exit':
                 self.assertEqual(value, 0)
                 break
-            if kind == 'line':
-                lines.append(value)
-        self.assertEqual(json.loads('\n'.join(lines)), [])
+            if kind == 'event' and value['event'] == 'result':
+                payloads.append(value['data'])
+        self.assertEqual(payloads, [[]])
 
     def test_tui_width_clipping_handles_chinese(self):
         self.assertEqual(clip('设备 ABC', 5), '设备 ')

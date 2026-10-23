@@ -52,6 +52,7 @@ class TestIncrementalArchive(unittest.TestCase):
         return journal, spool
 
     def complete(self, journal, next_cursor):
+        journal.update(json.loads(self.paths['journal'].read_text()))
         journal['completed'] = {'next_cursor':next_cursor,'validation':{'verification':'complete'}}
         _json_atomic(self.paths['journal'], journal)
 
@@ -130,13 +131,16 @@ class TestIncrementalArchive(unittest.TestCase):
             _check_archive_or_recover(self.paths,state)
         self.assertEqual(_state_loaded(self.paths)['next_cursor'],102)
 
-    def test_corrupt_partial_row_stops_sync(self):
+    def test_uncheckpointed_torn_tail_is_preserved_and_recovered(self):
         state=self.adopt()
         _,spool=self.initialize_pending(state)
         spool.append([make_rec(30)],[{'block':0,'records':1}])
         with self.paths['pending'].open('a') as f:f.write('partial,bad,row\n')
-        with self.assertRaisesRegex(RuntimeError, 'corrupt CSV|failed integrity'):
-            _pending_loaded(self.paths,state)
+        _, rows = _pending_loaded(self.paths,state)
+        self.assertEqual(len(rows), 1)
+        evidence = list(self.output.parent.glob('*.unconfirmed-*.bin'))
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].read_bytes(), b'partial,bad,row\n')
 
     def test_adopt_refuses_wrong_cursor(self):
         metadata=json.loads(self.metadata.read_text())
