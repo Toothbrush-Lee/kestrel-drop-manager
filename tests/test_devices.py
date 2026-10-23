@@ -126,7 +126,7 @@ class IdentityTests(unittest.TestCase):
             fleet=Fleet({'a':{'name':'custom','services':[devices.DROP_SERVICE],'model':f'Kestrel DROP {number}','serial':b'001234\x00\x00'}})
             with fleet.patches(): identity=asyncio.run(devices.identify('a',timeout=1))
             self.assertEqual((identity['serial'],identity['device_type'],identity['identity_verified']),('001234',f'D{number}',True))
-            self.assertEqual(identity['history_supported'],number==3)
+            self.assertEqual(identity['history_supported'],True)
             self.assertEqual(fleet.writes,[])
             self.assertEqual({u for _,u in fleet.reads},{devices.MODEL_UUID,devices.SERIAL_UUID})
 
@@ -184,9 +184,9 @@ class IdentityTests(unittest.TestCase):
             with self.assertRaises(DeviceMismatch): asyncio.run(self.library.register(serial='123',timeout=1))
         self.assertFalse(self.library.root.exists())
 
-    def test_d1_registration_does_not_enable_d3_ingestion(self):
+    def test_d1_registration_does_not_allow_d3_csv_as_d2_import(self):
         store=self.library._writable_store(); store.register_device('1','DROP 1')
-        with self.assertRaises(RuntimeError): store.ensure_device('1','DROP 1')
+        store.ensure_device('1','DROP 1')
         with self.assertRaises(RuntimeError): store.import_rows('2','DROP 2',rows(),103,{})
         self.assertEqual(store.summary()['records'],0)
 
@@ -297,20 +297,39 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(library.database_info()['records'],2)
         self.assertEqual([e['serial'] for e in stream if e['event']=='completed'],['1','2'])
 
-    def test_unsupported_d1_in_mixed_batch_does_not_prevent_d3_download(self):
+    def test_unknown_model_in_mixed_batch_does_not_prevent_d3_download(self):
         fleet=Fleet({'a':{'name':'D1 - 1'},'b':{'name':'D3 - 2'}})
         d1=FakeBLE([record(20)],101,serial='1')
         d3=FakeBLE([record(25)],201,serial='2')
         base=d1.module.BleakClient
         class D1Client(base):
-            async def read_gatt_char(self,uuid): return b'1' if uuid==devices.SERIAL_UUID else b'Kestrel DROP 1'
+            async def read_gatt_char(self,uuid): return b'1' if uuid==devices.SERIAL_UUID else b'Kestrel DROP 30'
         fleet.module.BleakClient=lambda device,**kwargs: D1Client(device,**kwargs) if device.address=='a' else d3.module.BleakClient(device,**kwargs)
         with fleet.patches(): code,stream=self.run_cli(['download','--serials','1','2','--execute','--timeout','1'])
         self.assertEqual(code,2)
         self.assertEqual(d1.writes,[])
         self.assertEqual(manager.Library(self.root/'library').database_info()['records'],1)
         error=next(e for e in stream if e['event']=='error')
-        self.assertEqual((error['serial'],error['code']),('1','unsupported_model'))
+        self.assertEqual((error['serial'],error['code']),('1','device_mismatch'))
+
+    def test_d1_d2_d3_mixed_batch_keeps_raw_width_nulls_and_cursors_separate(self):
+        fleet=Fleet({address:{'name':model+' - '+serial}
+            for address,model,serial in [('a','D1','1'),('b','D2','2'),('c','D3','3')]})
+        from test_manager import RAW
+        clients={address:FakeBLE([RAW[:width]],cursor,serial=serial,model=model)
+            for address,model,serial,width,cursor in [('a','D1','1',9,101),('b','D2','2',16,201),('c','D3','3',21,301)]}
+        fleet.module.BleakClient=lambda device,**kwargs: clients[device.address].module.BleakClient(device,**kwargs)
+        with fleet.patches():
+            code,stream=self.run_cli(['download','--serials','1','2','3','--ble-ids','a','b','c','--execute','--timeout','1'])
+        self.assertEqual(code,0);self.assertEqual(fleet.scans,1)
+        library=manager.Library(self.root/'library');library.store.check()
+        for serial,width,cursor in [('1',9,101),('2',16,201),('3',21,301)]:
+            row=library.records(serial)[0]
+            self.assertEqual(row['record_hex'],RAW[:width].hex())
+            self.assertEqual(row['absolute_cursor'],cursor-1)
+            self.assertEqual(row['serial'],serial)
+            self.assertEqual(row['station_pressure_hpa'] is None,serial!='3')
+        self.assertEqual([e['serial'] for e in stream if e['event']=='completed'],['1','2','3'])
 
     def test_cancelling_batch_keeps_first_pending_and_does_not_start_second(self):
         fleet=Fleet({'a':{'name':'D3 - 1'},'b':{'name':'D3 - 2'}})
@@ -339,7 +358,15 @@ class MultiDeviceUI(unittest.TestCase):
         self.assertIn('型号',text)
         for kind in ('D1','D2','D3'): self.assertIn(kind,text)
         self.assertIn('待核验',text)
-        self.assertIn('历史待适配',text)
+        self.assertIn('历史采集',text)
+
+    def test_d1_preview_renders_absent_measurements(self):
+        terminal=self.terminal({})
+        terminal.preview=[{'timestamp_device_local':'2026-10-23 00:00:00',
+            'temperature_c':21.66,'relative_humidity_pct':None,'station_pressure_hpa':None}]
+        terminal.draw()
+        text=' '.join(terminal.screen.lines)
+        self.assertIn('21.66',text);self.assertIn('--',text);self.assertNotIn('None',text)
 
     def test_unknown_serial_enter_reads_and_registers_instead_of_guessing(self):
         terminal=self.terminal({'ble:a':{'ble_id':'a','device_type':'D1','serial':None}})
@@ -354,10 +381,35 @@ class MultiDeviceUI(unittest.TestCase):
             start.assert_called_once_with('download',['download','--serials','1','--ble-ids','a','--execute'])
 
     def test_unmarked_batch_includes_new_scanned_devices(self):
-        terminal=self.terminal({'1':{'serial':'1'},'2':{'serial':'2','ble_id':'b'}})
+        terminal=self.terminal({'1':{'serial':'1','nearby':True},'2':{'serial':'2','ble_id':'b','nearby':True}})
         with patch.object(terminal,'start') as start:
             terminal.handle('a')
             start.assert_called_once_with('download',['download','--serials','1','2','--ble-ids','-','b','--execute'])
+
+    def test_default_batch_excludes_offline_and_unsupported_devices(self):
+        terminal=self.terminal({'1':{'serial':'1','nearby':True,'device_type':'D1','history_supported':False},
+            '2':{'serial':'2','nearby':True,'device_type':'D2','history_supported':False},
+            '3':{'serial':'3','nearby':False,'device_type':'D3','history_supported':True},
+            '4':{'serial':'4','nearby':True,'device_type':'D3','history_supported':True,'ble_id':'four'}})
+        with patch.object(terminal,'start') as start:
+            terminal.handle('a')
+            start.assert_called_once_with('download',['download','--serials','4','--ble-ids','four','--execute'])
+        self.assertIn('历史待适配',''.join(terminal.logs))
+        self.assertIn('本次未扫描到',''.join(terminal.logs))
+
+    def test_explicitly_marked_offline_device_can_still_be_retried(self):
+        terminal=self.terminal({'1':{'serial':'1','nearby':False,'history_supported':True}})
+        terminal.marked={'1'}
+        with patch.object(terminal,'start') as start:
+            terminal.handle('a')
+            start.assert_called_once_with('download',['download','--serials','1','--ble-ids','-','--execute'])
+
+    def test_marking_unsupported_model_does_not_launch_a_failing_batch(self):
+        terminal=self.terminal({'1':{'serial':'1','nearby':True,'device_type':'D1','history_supported':False}})
+        terminal.marked={'1'}
+        with patch.object(terminal,'start') as start:
+            terminal.handle('a'); start.assert_not_called()
+        self.assertIn('没有可采集目标',terminal.message)
 
     def test_unsupported_single_download_shows_explanation_without_ble_write(self):
         terminal=self.terminal({'1':{'serial':'1','device_type':'D1','history_supported':False}})

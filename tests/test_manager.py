@@ -25,8 +25,9 @@ def record(minute):
 
 
 class FakeBLE:
-    def __init__(self, rows, cursor, *, interrupt=False, serial='2866855'):
+    def __init__(self, rows, cursor, *, interrupt=False, serial='2866855', model='D3', schema=None):
         self.rows, self.cursor = rows, cursor
+        self.model, self.schema = model, schema
         self.interrupt, self.serial = interrupt, serial
         self.writes = []
         self.stopped = False
@@ -43,7 +44,7 @@ class FakeBLE:
                 pass
 
             async def read_gatt_char(self, uuid):
-                return owner.serial.encode() if uuid == protocol.SERIAL_UUID else b'Kestrel DROP 3'
+                return owner.serial.encode() if uuid == protocol.SERIAL_UUID else ('Kestrel DROP '+owner.model[1:]).encode()
 
             async def start_notify(self, uuid, callback):
                 self.callback = callback
@@ -62,7 +63,8 @@ class FakeBLE:
                     self.transmit(3, len(owner.rows).to_bytes(4, 'little'))
                 elif frame.kind == 0 and frame.payload[:2] == b'\x05\x00':
                     self.transmit(4, b'\x05\x00')
-                    self.transmit(1, b'schema')
+                    from kestrel_drop.layouts import profile
+                    self.transmit(1, owner.schema if owner.schema is not None else profile(owner.model).schema)
                 elif frame.kind == 4 and frame.payload == b'\x05\x00':
                     if self.phase == 0:
                         self.transmit(3, b'\x00\x00' + b''.join(owner.rows))
@@ -161,8 +163,8 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(fake.writes, [])
         self.assertFalse(self.library.archives())
 
-    def test_d1_and_d2_models_rejected_before_any_proprietary_write(self):
-        for model in (b'Kestrel DROP 1',b'Kestrel DROP 2'):
+    def test_unknown_models_rejected_before_any_proprietary_write(self):
+        for model in (b'Kestrel DROP 10',b'Kestrel DROP 3 Fire'):
             with self.subTest(model=model):
                 fake=FakeBLE([record(20)],101)
                 original=fake.module.BleakClient
@@ -170,9 +172,51 @@ class LibraryTests(unittest.TestCase):
                     async def read_gatt_char(self,uuid):
                         return b'2866855' if uuid==protocol.SERIAL_UUID else model
                 fake.module.BleakClient=Client
-                with self.assertRaisesRegex(RuntimeError,'unsupported model'): self.download(fake)
+                with self.assertRaisesRegex(RuntimeError,'核验'): self.download(fake)
                 self.assertEqual(fake.writes,[])
                 self.assertFalse(self.library.archives())
+
+    def test_d1_d2_captured_records_download_incremental_and_backup(self):
+        samples={'D1':bytes.fromhex('000f041a0ce9077608'),
+                 'D2':bytes.fromhex('0000070f02ea073708b7086c070080ff')}
+        for kind,raw in samples.items():
+            with self.subTest(kind=kind):
+                library=manager.Library(self.root/kind)
+                self.assertEqual(self.download(FakeBLE([raw],101,model=kind),library),0)
+                row=library.records('2866855')[0]
+                self.assertIsNone(row['station_pressure_hpa'])
+                self.assertIsNone(row['density_altitude_m_raw'])
+                self.assertEqual(row['temperature_c'],21.66 if kind=='D1' else 21.03)
+                self.assertEqual(row['relative_humidity_pct'],None if kind=='D1' else 22.31)
+                self.assertEqual(row['dew_point_c'],None if kind=='D1' else -1.28)
+                newer=bytearray(raw); newer[1]+=5
+                with self.assertRaises(asyncio.CancelledError):
+                    self.download(FakeBLE([bytes(newer)],102,model=kind,interrupt=True),library)
+                self.assertEqual(library.status()[0]['pending_records'],1)
+                destination=self.root/(kind+'.sqlite')
+                library.store.backup(destination)
+                from kestrel_drop.database import Store
+                restored=Store(destination)
+                restored.check()
+                self.assertEqual(restored.resume('2866855')[0],102)
+                self.assertEqual(self.download(FakeBLE([],102,model=kind),library),3)
+                newer[1]+=5
+                self.assertEqual(self.download(FakeBLE([bytes(newer)],103,model=kind),library),0)
+                self.assertEqual(len(library.records('2866855')),3)
+                self.assertEqual(library.status()[0]['pending_records'],0)
+                library.store.check()
+                self.assertEqual(self.download(FakeBLE([],103,model=kind),library),0)
+                self.assertEqual(len(library.records('2866855')),3)
+
+    def test_mismatched_schema_is_rejected_before_schema_ack_and_publication(self):
+        from kestrel_drop.layouts import profile
+        for kind in ('D1','D2','D3'):
+            library=manager.Library(self.root/kind)
+            fake=FakeBLE([record(20)],101,model=kind,schema=profile(kind).schema+b'\x00')
+            with self.assertRaisesRegex(protocol.TransferError,'schema'):
+                self.download(fake,library)
+            self.assertFalse(any(f.kind==4 and f.payload==b'\x05\x00' for f in fake.writes))
+            self.assertEqual(library.database_info()['records'],0)
 
     def test_empty_device_does_not_publish_empty_archive(self):
         self.download(FakeBLE([], 0))

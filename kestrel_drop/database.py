@@ -1,4 +1,4 @@
-"""Single durable authority for observations and BLE recovery (schema 2).
+"""Single durable authority for observations and BLE recovery (schema 3).
 
 Block transactions commit before ACK. Final publication, cursor advancement and
 pending cleanup are one transaction. Read operations never repair or reindex.
@@ -18,14 +18,12 @@ import tempfile
 from . import protocol
 from .errors import MigrationRequired
 from .devices import canonical_model, model_type, capabilities, serial_number
+from .layouts import MEASUREMENTS, FIELDS, profile
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 APPLICATION_ID = 0x4B445250
 DECODER = 'd3-21-v1'
-MEASUREMENTS = ('temperature_c', 'relative_humidity_pct', 'station_pressure_hpa',
-                'heat_index_c', 'dew_point_c', 'density_altitude_m_raw',
-                'density_altitude_m_official_integer_estimate')
-FIELDS = ('timestamp_device_local', *MEASUREMENTS, 'unknown_byte', 'block', 'position_in_block', 'record_hex')
+
 SCHEMA = (
     '''CREATE TABLE devices (serial TEXT PRIMARY KEY, model TEXT NOT NULL, alias TEXT NOT NULL DEFAULT '')''',
     '''CREATE TABLE histories (
@@ -43,15 +41,15 @@ SCHEMA = (
         final_cursor INTEGER, validation_json TEXT)''',
     '''CREATE TABLE pending_blocks (
         transfer_id INTEGER NOT NULL REFERENCES transfers(id), sequence INTEGER NOT NULL CHECK(sequence >= 0),
-        payload BLOB NOT NULL CHECK(length(payload)>0 AND length(payload)%21=0),
+        payload BLOB NOT NULL CHECK(length(payload)>0),
         sha256 TEXT NOT NULL, PRIMARY KEY(transfer_id, sequence)) WITHOUT ROWID''',
     '''CREATE TABLE observations (
         history_id INTEGER NOT NULL REFERENCES histories(id), absolute_cursor INTEGER NOT NULL CHECK(absolute_cursor>=0),
-        timestamp_device_local TEXT NOT NULL, temperature_c REAL NOT NULL, relative_humidity_pct REAL NOT NULL,
-        station_pressure_hpa REAL NOT NULL, heat_index_c REAL NOT NULL, dew_point_c REAL NOT NULL,
-        density_altitude_m_raw REAL NOT NULL, density_altitude_m_official_integer_estimate INTEGER NOT NULL,
-        unknown_byte INTEGER NOT NULL, block INTEGER NOT NULL, position_in_block INTEGER NOT NULL,
-        record_raw BLOB NOT NULL CHECK(length(record_raw)=21),
+        timestamp_device_local TEXT NOT NULL, temperature_c REAL NOT NULL, relative_humidity_pct REAL,
+        station_pressure_hpa REAL, heat_index_c REAL, dew_point_c REAL,
+        density_altitude_m_raw REAL, density_altitude_m_official_integer_estimate INTEGER,
+        unknown_byte INTEGER, block INTEGER NOT NULL, position_in_block INTEGER NOT NULL,
+        record_raw BLOB NOT NULL CHECK(length(record_raw) IN (9,16,21)),
         PRIMARY KEY(history_id, absolute_cursor)) WITHOUT ROWID''',
     'CREATE INDEX observations_time ON observations(history_id, timestamp_device_local, absolute_cursor)',
     'CREATE INDEX transfers_history ON transfers(history_id, id)',
@@ -62,14 +60,18 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
-def checked_rows(rows):
+def checked_rows(rows, model='D3'):
     result = []
     for row in rows:
         raw = bytes.fromhex(row['record_hex'])
-        decoded = protocol.decode_record(raw, block=int(row['block']), position=int(row['position_in_block']))
-        if any(not math.isfinite(float(row[k])) or abs(float(row[k]) - decoded[k]) > 1e-6 for k in MEASUREMENTS):
-            raise RuntimeError('记录测量字段与原始字节不一致')
-        if any(str(row[k]) != str(decoded[k]) for k in ('timestamp_device_local', 'unknown_byte')):
+        decoded = protocol.decode_record(raw, block=int(row['block']), position=int(row['position_in_block']), model=model)
+        for k in MEASUREMENTS:
+            if decoded[k] is None:
+                if row.get(k) not in (None, ''): raise RuntimeError('型号不具备的测量字段必须为空')
+            elif row.get(k) is None or not math.isfinite(float(row[k])) or abs(float(row[k]) - decoded[k]) > 1e-6:
+                raise RuntimeError('记录测量字段与原始字节不一致')
+        if (row['timestamp_device_local'] != decoded['timestamp_device_local'] or
+                row.get('unknown_byte') not in ((None, '') if decoded['unknown_byte'] is None else (decoded['unknown_byte'], str(decoded['unknown_byte'])))):
             raise RuntimeError('记录时间或未知字段与原始字节不一致')
         if decoded['block'] < 0 or decoded['position_in_block'] < 0:
             raise RuntimeError('记录块位置无效')
@@ -87,6 +89,10 @@ class Store:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.connect(writable=True, create=True) as connection:
                 version = connection.execute('PRAGMA user_version').fetchone()[0]
+                if version == 2:
+                    if connection.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID:
+                        raise RuntimeError('数据库来源不受支持，拒绝升级')
+                    self._upgrade_v2(connection)
                 if version == 0:
                     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone():
                         raise RuntimeError('数据库格式不受支持，拒绝覆盖')
@@ -100,9 +106,34 @@ class Store:
         with self.connect() as connection:
             if connection.execute('PRAGMA user_version').fetchone()[0] == 1:
                 raise MigrationRequired('旧版 SQLite 需要运行 migrate；文件未被覆盖')
-            if (connection.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION or
+            if (connection.execute('PRAGMA user_version').fetchone()[0] not in (2, SCHEMA_VERSION) or
                     connection.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID):
                 raise RuntimeError('数据库需要迁移或版本不受支持；旧版本请运行 migrate，文件未被覆盖')
+
+    def _upgrade_v2(self, connection):
+        # Publish a complete, independent schema-2 snapshot before any DDL.
+        import uuid
+        directory = self.path.parent / 'backups'
+        directory.mkdir(exist_ok=True)
+        backup = directory / ('schema2-before-upgrade-' + uuid.uuid4().hex[:12] + '.sqlite')
+        Store(self.path).backup(backup)
+        with connection:
+            connection.execute('BEGIN IMMEDIATE')
+            self._copy_v2_tables(connection)
+            connection.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+
+    def _copy_v2_tables(self, connection):
+        for index, name in ((3, 'pending_blocks'), (4, 'observations')):
+            connection.execute(SCHEMA[index].replace('CREATE TABLE ' + name, 'CREATE TABLE ' + name + '_v3', 1))
+            connection.execute(f'INSERT INTO {name}_v3 SELECT * FROM {name}')
+            connection.execute(f'DROP TABLE {name}')
+            connection.execute(f'ALTER TABLE {name}_v3 RENAME TO {name}')
+        connection.execute(SCHEMA[5])
+
+    def _layout(self, connection, history_id):
+        model = connection.execute('SELECT d.model FROM devices d JOIN histories h USING(serial) WHERE h.id=?', (history_id,)).fetchone()
+        if model is None: raise RuntimeError('下载缺少设备身份')
+        return profile(model[0])
 
     @contextmanager
     def connect(self, *, writable=False, create=False):
@@ -132,8 +163,7 @@ class Store:
         return row
 
     def ensure_device(self, serial, model):
-        if model_type(model) != 'D3':
-            raise RuntimeError('当前仅支持已核验序列号的 DROP D3 历史下载')
+        profile(model)
         self.register_device(serial, model)
 
     def register_device(self, serial, model):
@@ -154,7 +184,7 @@ class Store:
         rows = []
         transfers = connection.execute("SELECT * FROM transfers WHERE history_id=? AND status IN ('receiving','interrupted') ORDER BY id", (history['id'],)).fetchall()
         for transfer in transfers:
-            if transfer['decoder_version'] != DECODER:
+            if transfer['decoder_version'] != self._layout(connection, history['id']).decoder:
                 raise RuntimeError('下载解析器版本不受支持，拒绝猜测恢复位置')
             if transfer['requested_cursor'] != cursor:
                 raise RuntimeError('待确认下载游标不连续')
@@ -168,12 +198,18 @@ class Store:
         return rows, cursor
 
     def _blocks(self, connection, transfer_id):
+        transfer = connection.execute('SELECT history_id,decoder_version FROM transfers WHERE id=?', (transfer_id,)).fetchone()
+        if transfer is None: raise RuntimeError('下载会话不存在')
+        layout = self._layout(connection, transfer['history_id'])
+        if transfer['decoder_version'] != layout.decoder: raise RuntimeError('下载解析器与型号不一致')
+        width = layout.record_bytes
         rows, meta = [], []
         for block in connection.execute('SELECT * FROM pending_blocks WHERE transfer_id=? ORDER BY sequence', (transfer_id,)):
             payload = block['payload']
             if block['sequence'] != len(meta) or hashlib.sha256(payload).hexdigest() != block['sha256']:
                 raise RuntimeError('待确认块的序号或摘要校验失败')
-            records = [protocol.decode_record(payload[i:i+21], block=block['sequence'], position=i//21) for i in range(0, len(payload), 21)]
+            if len(payload) % width: raise RuntimeError('待确认记录长度与设备型号不一致')
+            records = [layout.decode(payload[i:i+width], block=block['sequence'], position=i//width) for i in range(0, len(payload), width)]
             rows.extend(records)
             meta.append({'block': block['sequence'], 'records': len(records)})
         protocol._check_order(rows)
@@ -202,20 +238,21 @@ class Store:
                     raise RuntimeError('下载恢复位置与事务中的边界不一致')
                 connection.execute("UPDATE transfers SET status='interrupted' WHERE history_id=? AND status='receiving'", (history['id'],))
             return connection.execute('''INSERT INTO transfers(history_id,requested_cursor,expected_count,started_utc,decoder_version,status)
-                VALUES(?,?,?,?,?,'receiving')''', (history['id'], requested_cursor, expected_count, utcnow(), DECODER)).lastrowid
+                VALUES(?,?,?,?,?,'receiving')''', (history['id'], requested_cursor, expected_count, utcnow(), self._layout(connection, history['id']).decoder)).lastrowid
 
     def append_block(self, transfer_id, rows, blocks):
-        encoded = checked_rows(rows)
         if len(blocks) != 1 or not rows or blocks[0]['records'] != len(rows):
             raise RuntimeError('无效的接收块')
         sequence = blocks[0]['block']
-        if any(d['block'] != sequence or d['position_in_block'] != i for i, (_, d) in enumerate(encoded)):
-            raise RuntimeError('接收块内的位置不连续')
-        payload = b''.join(raw for raw, _ in encoded)
         with self.transaction() as connection:
             transfer = connection.execute('SELECT * FROM transfers WHERE id=?', (transfer_id,)).fetchone()
             if transfer is None or transfer['status'] != 'receiving':
                 raise RuntimeError('下载会话不是接收状态')
+            layout = self._layout(connection, transfer['history_id'])
+            encoded = checked_rows(rows, model=layout.kind)
+            if any(d['block'] != sequence or d['position_in_block'] != i for i, (_, d) in enumerate(encoded)):
+                raise RuntimeError('接收块内的位置不连续')
+            payload = b''.join(raw for raw, _ in encoded)
             last_block = connection.execute('SELECT sequence FROM pending_blocks WHERE transfer_id=? ORDER BY sequence DESC LIMIT 1', (transfer_id,)).fetchone()
             if sequence != (last_block[0] + 1 if last_block else 0):
                 raise RuntimeError('接收块序号不连续')
@@ -226,7 +263,7 @@ class Store:
             if prior:
                 if hashlib.sha256(prior['payload']).hexdigest() != prior['sha256']:
                     raise RuntimeError('待确认块摘要校验失败')
-                last = protocol.decode_record(prior['payload'][-21:], block=0, position=0)['timestamp_device_local']
+                last = layout.decode(prior['payload'][-layout.record_bytes:], block=0, position=0)['timestamp_device_local']
             else:
                 saved = connection.execute('SELECT timestamp_device_local FROM observations WHERE history_id=? ORDER BY absolute_cursor DESC LIMIT 1', (history['id'],)).fetchone()
                 last = saved[0] if saved else None
@@ -252,7 +289,7 @@ class Store:
             if history['next_cursor'] is not None and cursor != next_cursor:
                 raise RuntimeError('正式游标与累计待确认记录数不一致')
             first = next_cursor - len(rows)
-            self._insert(connection, history['id'], first, checked_rows(rows))
+            self._insert(connection, history['id'], first, checked_rows(rows, model=self._layout(connection, history['id']).kind))
             connection.execute('UPDATE histories SET first_cursor=coalesce(first_cursor,?), next_cursor=? WHERE id=?', (first, next_cursor, history['id']))
             connection.execute("UPDATE transfers SET status='completed', finished_utc=? WHERE history_id=? AND status IN ('receiving','interrupted')", (utcnow(), history['id']))
             connection.execute('UPDATE transfers SET final_cursor=?,validation_json=? WHERE id=?', (next_cursor, json.dumps(validation), transfer_id))
@@ -303,7 +340,7 @@ class Store:
                         **capabilities(h['model'])}
                 try:
                     if h['next_cursor'] is None:
-                        pending = connection.execute('SELECT coalesce(sum(length(payload)/21),0) FROM pending_blocks b JOIN transfers t ON t.id=b.transfer_id WHERE history_id=?', (h['id'],)).fetchone()[0]
+                        pending = connection.execute(f'SELECT coalesce(sum(length(payload)/{profile(h["model"]).record_bytes}),0) FROM pending_blocks b JOIN transfers t ON t.id=b.transfer_id WHERE history_id=?', (h['id'],)).fetchone()[0]
                         attempts = connection.execute("SELECT count(*) FROM transfers WHERE history_id=? AND status IN ('receiving','interrupted','superseded')", (h['id'],)).fetchone()[0]
                         resume = 0
                     else:
@@ -341,18 +378,17 @@ class Store:
                 raise RuntimeError('数据库完整性或外键检查失败')
             for h in connection.execute('SELECT h.*,d.model FROM histories h JOIN devices d USING(serial)'):
                 records = connection.execute('SELECT * FROM observations WHERE history_id=? ORDER BY absolute_cursor', (h['id'],)).fetchall()
-                if records and model_type(h['model']) != 'D3':
-                    raise RuntimeError('未支持型号包含历史记录，拒绝套用 D3 解析器')
+                layout = profile(h['model'])
                 if h['next_cursor'] is None:
                     if records: raise RuntimeError('未初始化历史包含正式记录')
                 elif (len(records) != h['next_cursor'] - h['first_cursor'] or
                       any(r['absolute_cursor'] != h['first_cursor'] + i for i, r in enumerate(records))):
                     raise RuntimeError('历史游标不连续')
-                checked_rows([dict(r, record_hex=r['record_raw'].hex()) for r in records])
+                checked_rows([dict(r, record_hex=r['record_raw'].hex()) for r in records], model=layout.kind)
                 self._pending(connection, h)
                 for t in connection.execute('SELECT id,decoder_version,status FROM transfers WHERE history_id=?', (h['id'],)):
                     self._blocks(connection, t['id'])
-                    if t['decoder_version'] != DECODER: raise RuntimeError('解析器版本不受支持')
+                    if t['decoder_version'] != layout.decoder: raise RuntimeError('解析器版本不受支持')
                     if t['status'] in ('completed','imported') and connection.execute('SELECT 1 FROM pending_blocks WHERE transfer_id=?', (t['id'],)).fetchone():
                         raise RuntimeError('完成的下载仍含待确认数据')
         return self.summary()
@@ -361,7 +397,9 @@ class Store:
         devices = self.status()
         with self.connect() as connection:
             sessions = connection.execute('SELECT count(*) FROM transfers').fetchone()[0]
-        return {'database': str(self.path), 'schema_version': SCHEMA_VERSION,
+        with self.connect() as connection:
+            version = connection.execute('PRAGMA user_version').fetchone()[0]
+        return {'database': str(self.path), 'schema_version': version,
                 'records': sum(d['database_records'] for d in devices), 'transfers': sessions, 'devices': devices}
 
     def backup(self, destination):

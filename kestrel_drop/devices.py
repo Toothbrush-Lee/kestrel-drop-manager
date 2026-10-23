@@ -40,8 +40,8 @@ def canonical_model(value):
 
 def capabilities(value):
     kind = model_type(value)
-    return {'device_type': kind or '未知', 'history_supported': kind == 'D3',
-            'supported': kind == 'D3', 'identification_supported': kind is not None}
+    return {'device_type': kind or '未知', 'history_supported': kind in ('D1', 'D2', 'D3'),
+            'supported': kind in ('D1', 'D2', 'D3'), 'identification_supported': kind is not None}
 
 
 def advertisement(device, adv):
@@ -56,7 +56,7 @@ def advertisement(device, adv):
             'ble_id': device.address, 'rssi': adv.rssi, 'device_type': kind or '未知',
             'model': 'Kestrel DROP ' + kind[1] if kind else None,
             'identity_verified': False, 'identity_source': 'advertisement',
-            'history_supported': kind == 'D3', 'supported': kind == 'D3',
+            'history_supported': kind in ('D1', 'D2', 'D3'), 'supported': kind in ('D1', 'D2', 'D3'),
             'identification_supported': True}
 
 

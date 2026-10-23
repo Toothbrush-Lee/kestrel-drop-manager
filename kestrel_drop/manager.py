@@ -134,7 +134,7 @@ class Library:
         events.emit('completed', **outcome)
         return code
 
-    async def download(self, serial, *, execute=False, ble_id=None, timeout=20.0, maxrows=6220, progress_factory=None, discovery=None):
+    async def download(self, serial, *, execute=False, ble_id=None, timeout=20.0, maxrows=20000, progress_factory=None, discovery=None):
         serial = serial_number(serial)
         if timeout <= 0 or maxrows < 1:
             raise ValueError('扫描时间和记录上限必须为正数')
@@ -158,7 +158,7 @@ class Library:
                     devices.require_identity(identity, expected=serial, history=True)
                     store.ensure_device(serial, devices.canonical_model(identity['model']))
                     cursor, pending = store.resume(serial)
-                    session = protocol.BleSession(client)
+                    session = protocol.BleSession(client, model=identity['model'])
                     await client.start_notify(protocol.UP_UUID, session.callback)
                     try:
                         events.emit('phase', serial=serial, phase='querying')
@@ -223,7 +223,7 @@ class Library:
 
 def parser():
     import argparse
-    ap = argparse.ArgumentParser(description='Kestrel DROP 多设备识别与 D3 下载管理（默认打开中文 TUI）')
+    ap = argparse.ArgumentParser(description='Kestrel DROP 多设备识别与 D1/D2/D3 下载管理（默认打开中文 TUI）')
     ap.add_argument('--data-dir', default=None, help='数据目录；优先使用已保存位置或 KESTREL_DATA_DIR')
     ap.add_argument('--events-json', action='store_true', help='输出版本化 JSON Lines 事件，供 TUI / 自动化使用')
     sub = ap.add_subparsers(dest='command')
@@ -257,7 +257,7 @@ def parser():
     download.add_argument('--ble-id', help='单设备 BLE 地址或 UUID')
     download.add_argument('--ble-ids', nargs='+', help='与 --serials 一一对应的临时连接地址；- 表示按编号寻找')
     download.add_argument('--timeout', type=float, default=20)
-    download.add_argument('--maxrows', type=int, default=6220)
+    download.add_argument('--maxrows', type=int, default=20000)
     download.add_argument('--execute', action='store_true', help='执行设备历史读取指令')
     imp = sub.add_parser('import', help='验证旧完整 CSV 与 .csv.json 并入库，不改源文件')
     imp.add_argument('csv', type=Path)

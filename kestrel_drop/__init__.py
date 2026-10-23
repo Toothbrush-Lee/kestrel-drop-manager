@@ -1,1 +1,1 @@
-"""Kestrel DROP D3 download manager, terminal UI, and BLE protocol."""
+"""Kestrel DROP D1/D2/D3 download manager, terminal UI, and BLE protocol."""

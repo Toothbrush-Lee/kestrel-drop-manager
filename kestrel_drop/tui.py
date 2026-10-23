@@ -399,7 +399,7 @@ class Terminal:
                 self.text_view = [
                     's 扫描 D1/D2/D3 广播；x 只读核验编号并登记，扫描名称仅作提示。',
                     '首次下载自动建档；以后使用保存的绝对游标，仅同步新增记录。',
-                    '空格勾选设备；a 采集勾选设备，无勾选时处理列表中所有有编号设备。',
+                    '空格勾选设备；a 采集可支持的勾选项，无勾选时只处理本次附近设备。',
                     'c 取消当前任务；q 取消并退出。已落盘数据保留。',
                     'n 手动输入序列号；未命名候选设备可同时指定 BLE UUID。',
                     'i 导入原始完整 CSV 与 .csv.json，源文件保留。',
@@ -409,7 +409,7 @@ class Terminal:
                     'r 只读刷新本地档案；l 查看日志，↑↓ / PgUp / PgDn 滚动。',
                     '首次下载中断：保留在数据库，下次重新读取完整历史。',
                     '增量下载中断：数据库保留待确认块，下次从绝对游标恢复。',
-                    'D1/D2 可核验登记，历史下载仍限 D3；未适配型号不发送历史指令。',
+                    'D1/D2/D3 分别解析历史；字段声明不匹配时拒绝入库。',
                     '设备时间没有时区；结束日期只写日期时包含当天整天。',
                 ]
                 self.text_offset = 0
@@ -485,14 +485,29 @@ class Terminal:
                         args += ['--ble-id', device['ble_id']]
                     self.start('download', args)
             elif key == 'a':
-                targets = list(dict.fromkeys(item['serial'] for item in self.devices.values()
-                    if item.get('serial') and not item.get('identity_conflict')
-                    and (not self.marked or item['serial'] in self.marked)))
+                targets, addresses, skipped = [], [], []
+                for item in self.devices.values():
+                    serial = item.get('serial')
+                    if self.marked and serial not in self.marked:
+                        continue
+                    if not serial or item.get('identity_conflict'):
+                        skipped.append(f'{serial or item.get("name", "未知设备")}：身份未核验或冲突')
+                        continue
+                    if item.get('history_supported') is False:
+                        skipped.append(f'{serial}：{item.get("device_type", "此型号")} 历史待适配')
+                        continue
+                    if not self.marked and not item.get('nearby'):
+                        skipped.append(f'{serial}：本次未扫描到')
+                        continue
+                    if serial not in targets:
+                        targets.append(serial)
+                        addresses.append(item.get('ble_id') or '-')
+                if skipped:
+                    self.logs.append('本次跳过（档案保留）：' + '；'.join(skipped))
                 if targets:
-                    addresses = [next((item.get('ble_id') or '-' for item in self.devices.values() if item.get('serial') == serial), '-') for serial in targets]
                     self.start('download', ['download', '--serials', *targets, '--ble-ids', *addresses, '--execute'])
                 else:
-                    self.message = '没有可选择的设备；先按 x 读取编号并登记'
+                    self.message = '没有可采集目标；先 s 扫描，离线档案保留。'
             elif key in ('v', 'e'):
                 if not device or not (device.get('csv') or device.get('database_records')) or device.get('error'):
                     self.message = '请先选择已建立且可校验的本地档案'
@@ -523,7 +538,7 @@ class Terminal:
             return
         self.put(0, 'KESTREL DROP  /  电脑下载管理', curses.A_BOLD)
         self.put(1, f'档案目录：{self.library.root}', curses.A_DIM)
-        self.put(2, 'D1/D2/D3 身份识别 · D3 历史采集 · 连接前断开手机 LiNK', curses.A_DIM)
+        self.put(2, 'D1/D2/D3 身份识别与历史采集 · 连接前断开手机 LiNK', curses.A_DIM)
         self.put(4, '选 型号  设备序列号          附近    已入库    未确认   状态 / 最新时间', curses.A_BOLD)
         visible = max(2, min(8, height - 15))
         values = list(self.devices.values())
@@ -533,8 +548,8 @@ class Terminal:
             kind = item.get('device_type') or model_type(item.get('model')) or '未知'
             state = (item.get('error') or ('身份冲突，请核验' if item.get('identity_conflict') else None)
                      or item.get('last_timestamp') or item.get('identity_error')
-                     or ('广播编号；x 核验' + ('，历史待适配' if kind in ('D1','D2') else '') if item.get('serial') and not item.get('identity_verified') else
-                         '历史待适配' if kind in ('D1','D2') else '待下载' if item.get('serial') else '按 x 读取编号'))
+                     or ('广播编号；x 核验' + ('，历史待适配' if item.get('history_supported') is False else '') if item.get('serial') and not item.get('identity_verified') else
+                         '历史待适配' if item.get('history_supported') is False else '待下载' if item.get('serial') else '按 x 读取编号'))
             pending = item.get('pending_records')
             line = (f'{"*" if item.get("serial") in self.marked else " "}  {kind:<4} {serial:<18} '
                     f'{"附近" if item.get("nearby") else "—":<4} '
@@ -556,8 +571,11 @@ class Terminal:
             self.put(0, '最近 100 条记录 · ↑↓ 滚动 · Esc/q 返回 · 时间为设备本地时间', curses.A_BOLD)
             self.put(2, '时间                    温度°C     湿度%     气压hPa')
             for index, item in enumerate(self.preview[self.preview_offset:self.preview_offset + height - 5]):
+                humidity = item['relative_humidity_pct']
+                pressure = item['station_pressure_hpa']
                 self.put(index + 3, f'{item["timestamp_device_local"]}   {item["temperature_c"]:>8}  '
-                         f'{item["relative_humidity_pct"]:>8}  {item["station_pressure_hpa"]:>10}')
+                         f'{str(humidity) if humidity is not None else "--":>8}  '
+                         f'{str(pressure) if pressure is not None else "--":>10}')
         if self.text_view is not None:
             self.screen.erase()
             self.put(0, '帮助 / 任务日志 · ↑↓ / PgUp / PgDn 滚动 · Esc/q 返回', curses.A_BOLD)

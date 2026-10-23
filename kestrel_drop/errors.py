@@ -34,7 +34,7 @@ class DeviceMismatch(AppError):
 
 class UnsupportedModel(AppError):
     code = 'unsupported_model'
-    action = '设备可以识别和登记；历史下载目前仅验证 D3，D1/D2 需独立抓包适配。'
+    action = '历史下载支持已验证字段布局的 D1/D2/D3；请保留日志核对实际型号与固件格式。'
 
 
 class BluetoothFailure(AppError):

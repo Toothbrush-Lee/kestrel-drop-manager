@@ -193,48 +193,26 @@ def signed24(data: bytes) -> int:
     return x - (1 << 24) if x >= (1 << 23) else x
 
 
-def decode_record(rec: bytes, *, block: int, position: int) -> dict:
-    if len(rec) != RECORD_BYTES:
-        raise ValueError(f'Expected 21 bytes, got {len(rec)}')
-    ss, mm, hh, day, month = rec[:5]
-    year = int.from_bytes(rec[5:7], 'little')
-    date = datetime(year, month, day, hh, mm, ss)
-    temp = int.from_bytes(rec[7:9], 'little', signed=True)
-    humidity = int.from_bytes(rec[9:11], 'little')
-    heat = int.from_bytes(rec[11:13], 'little', signed=True)
-    extra = rec[13]
-    dew = int.from_bytes(rec[14:16], 'little', signed=True)
-    pressure = int.from_bytes(rec[16:18], 'little')
-    density = signed24(rec[18:21])
-    return {
-        'timestamp_device_local': date.isoformat(sep=' '),
-        'temperature_c': temp / 100,
-        'relative_humidity_pct': humidity / 100,
-        'station_pressure_hpa': pressure / 10,
-        'heat_index_c': heat / 100,
-        'dew_point_c': dew / 100,
-        'density_altitude_m_raw': density / 10,
-        'density_altitude_m_official_integer_estimate': density // 10,
-        'unknown_byte': extra,
-        'block': block,
-        'position_in_block': position,
-        'record_hex': rec.hex(),
-    }
+def decode_record(rec: bytes, *, block: int, position: int, model='D3') -> dict:
+    from .layouts import profile
+    return profile(model).decode(rec, block=block, position=position)
 
 
-def log_rows_from_frames(frames: list[Frame]) -> tuple[list[dict], list[dict]]:
+def log_rows_from_frames(frames: list[Frame], model='D3') -> tuple[list[dict], list[dict]]:
+    from .layouts import profile
+    width = profile(model).record_bytes
     rows = []
     meta = []
     for f in frames:
-        if f.kind != 3 or len(f.payload) < 2 or (len(f.payload)-2) % RECORD_BYTES:
+        if f.kind != 3 or len(f.payload) < 2 or (len(f.payload)-2) % width:
             continue
         if len(f.payload) == 2:
             continue
         block = int.from_bytes(f.payload[:2], 'little')
         chunk = f.payload[2:]
         decoded = []
-        for n in range(0, len(chunk), RECORD_BYTES):
-            decoded.append(decode_record(chunk[n:n+RECORD_BYTES], block=block, position=n//RECORD_BYTES))
+        for n in range(0, len(chunk), width):
+            decoded.append(decode_record(chunk[n:n+width], block=block, position=n//width, model=model))
         meta.append({'block':block,'records':len(decoded),'length':len(f.payload)})
         rows.extend(decoded)
     if meta:
@@ -480,8 +458,11 @@ class TransferProgress:
 
 
 class BleSession:
-    """Reverse-engineered GATT client; field-tested on D3 full downloads only."""
-    def __init__(self,client):
+    """Reverse-engineered history client with per-model captured schemas."""
+    def __init__(self,client, *, model=None):
+        from .layouts import profile
+        self.layout = profile(model or 'D3')
+        self.require_schema = model is not None
         self.client=client
         self.parser=FrameStream()
         self.queue:asyncio.Queue[Frame]=asyncio.Queue()
@@ -523,18 +504,24 @@ class BleSession:
         await self.send(0,(5).to_bytes(2,'little')+cursor.to_bytes(4,'little')+b'\x00'*4)
         rows=[];blocks=[];next_cursor=None
         seen=set()
+        schema_seen=False
         while True:
             frame=await self.next(timeout=45)
             if frame.kind==4:
                 continue
             if frame.kind==1:
+                if self.require_schema and (schema_seen or rows or frame.payload != self.layout.schema):
+                    raise TransferError(f'{self.layout.kind} history schema differs from captured layout; nothing published')
+                schema_seen=True
                 # The observed original LiNK client acknowledges the field schema
                 # using opcode 05 before blocks are sent.
                 await self.ack(5)
                 continue
-            if frame.kind==3 and len(frame.payload)>2 and (len(frame.payload)-2)%RECORD_BYTES==0:
+            if frame.kind==3 and len(frame.payload)>2 and (len(frame.payload)-2)%self.layout.record_bytes==0:
+                if self.require_schema and not schema_seen:
+                    raise TransferError('History block arrived without a verified schema')
                 try:
-                    new,meta=log_rows_from_frames([frame])
+                    new,meta=log_rows_from_frames([frame], model=self.layout.kind)
                     _check_order(new)
                 except (ValueError, RuntimeError) as exc:
                     raise TransferError(f'Invalid record block: {exc}') from exc
