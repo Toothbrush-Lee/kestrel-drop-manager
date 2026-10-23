@@ -7,6 +7,7 @@ __pycache__/
 /archive/
 /data/originals/
 /data/analysis/
+/data/screenshots/
 /exports/
 *.sqlite
 *.sqlite-*

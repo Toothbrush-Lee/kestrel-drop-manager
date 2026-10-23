@@ -229,4 +229,19 @@ python3 -B -m unittest discover -s tests -v
 
 批量采集先共享一次广播扫描，再顺序连接；未出现在扫描快照中的设备会重新寻找。自定义名称的设备可在 TUI 中扫描、核验后选择采集，连接地址会按设备传给后台。CLI 可用与 `--serials` 等长的 `--ble-ids` 指定地址（`-` 表示按编号寻找）；地址只作为临时定位提示，连接后始终核对真实序列号。
 
-更多说明：[多设备审查与验收](docs/multi-device.md)、[存储设计](docs/storage.md)、[底层协议](docs/protocol.md)、[变更记录](CHANGELOG.md)。
+## 项目目录
+
+```text
+kestrel.py / Kestrel.command  日常启动入口
+kestrel_drop/                程序源码
+tests/                       自动化测试
+scripts/                     底层诊断入口
+docs/                        技术说明与各版本验收记录
+data/                        本地原件、研究结果与截图，不参与日常同步
+archive/                     当前本地档案：数据库、exports、backups、legacy
+pyproject.toml / uv.lock     项目配置与锁定依赖
+```
+
+根目录只放启动入口、项目配置和总览文档。`.venv/` 是 uv 管理的依赖环境，保留供下次启动使用；Python 缓存和 Finder 元数据可重新生成，不作为项目资料保存。不要为了整理目录手动搬动或删除 `archive/legacy/` 中的迁移证据。
+
+更多说明：[文档索引](docs/README.md)、[本地资料目录](data/README.md)、[存储设计](docs/storage.md)、[变更记录](CHANGELOG.md)。
