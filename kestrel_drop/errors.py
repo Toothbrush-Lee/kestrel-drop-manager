@@ -7,7 +7,7 @@ TITLES = {'operation_failed': '操作未完成', 'transfer_integrity': '传输�
           'not_found': '未找到文件或设备档案', 'invalid_input': '输入内容需要检查',
           'dependency_missing': '运行依赖尚未准备好', 'busy': '另一个任务正在使用档案',
           'storage_failed': '保存数据时发生错误', 'archive_check_failed': '档案校验未通过',
-          'completion_pending': '等待设备完成确认', 'worker_failed': '后台任务未正常完成', 'migration_required': '旧档案需要迁移'}
+          'completion_pending': '等待设备完成确认', 'worker_failed': '后台任务未正常完成', 'migration_required': '旧档案需要迁移', 'unsupported_model': '此型号的历史下载尚未支持'}
 
 
 class AppError(RuntimeError):
@@ -29,7 +29,12 @@ class TransferError(AppError):
 
 class DeviceMismatch(AppError):
     code = 'device_mismatch'
-    action = '核对机身型号和序列号，重新选择正确的 D3。'
+    action = '核对机身型号和序列号，重新选择正确的设备；编号读取失败时按 x 重新核验。'
+
+
+class UnsupportedModel(AppError):
+    code = 'unsupported_model'
+    action = '设备可以识别和登记；历史下载目前仅验证 D3，D1/D2 需独立抓包适配。'
 
 
 class BluetoothFailure(AppError):

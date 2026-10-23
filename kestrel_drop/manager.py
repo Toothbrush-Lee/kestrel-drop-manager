@@ -21,43 +21,29 @@ from . import protocol
 from .database import Store, FIELDS
 from .storage import default_root, writer_lock, legacy_archives, migrate, configure
 from . import events
-from .errors import BluetoothFailure, MigrationRequired, describe
+from .errors import MigrationRequired, describe
 
-DROP_SERVICE = '12630000-cc25-497d-9854-9b6c02c77054'
+from . import devices
+from .devices import DROP_SERVICE, serial_number
 
-
-async def _ble_call(operation, *args, **kwargs):
-    from bleak.exc import BleakError
-    try:
-        return await operation(*args, **kwargs)
-    except BleakError as exc:
-        raise BluetoothFailure(f'蓝牙操作失败：{exc}。请断开手机 LiNK，检查蓝牙开关和终端权限，然后重试。') from exc
+_ble_call = devices.ble_call
 
 
-def serial_number(value: str) -> str:
-    value = str(value).strip()
-    if not re.fullmatch(r'[0-9]{1,20}', value):
-        raise ValueError('序列号必须为 1–20 位数字')
-    return value
-
-
-async def discover(timeout: float = 15) -> list[dict]:
-    if timeout <= 0:
-        raise ValueError('扫描时间必须大于 0')
-    from bleak import BleakScanner
-    events.emit('phase', phase='scanning')
-    found = await _ble_call(BleakScanner.discover, timeout=timeout, return_adv=True)
-    devices = []
-    for device, adv in found.values():
-        name = (adv.local_name or device.name or '').strip()
-        match = re.fullmatch(r'D3\s*-\s*([0-9]{1,20})', name, re.I)
-        services = {x.lower() for x in adv.service_uuids or []}
-        if match or name.lower().startswith(('d2', 'd3', 'drop', 'kestrel')) or DROP_SERVICE in services:
-            devices.append({'serial': match[1] if match else None,
-                            'name': name or '未命名 DROP 候选设备',
-                            'ble_id': device.address, 'rssi': adv.rssi,
-                            'supported': bool(match)})
-    return sorted(devices, key=lambda d: d['rssi'] if d['rssi'] is not None else -999, reverse=True)
+async def discover(timeout=15, *, identify=False, register_to=None):
+    snapshot = await devices.scan_snapshot(timeout)
+    found = devices.candidates(snapshot)
+    if identify or register_to is not None:
+        for item in found:
+            try:
+                device = next(pair[0] for pair in snapshot.values() if pair[0].address == item['ble_id'])
+                result = await devices.identify(item['ble_id'], timeout=timeout, device=device)
+                item.update(result)
+                if register_to is not None:
+                    register_to.save_identity(result)
+                    item['registered'] = True
+            except (OSError, RuntimeError, ValueError) as exc:
+                item['identity_error'] = str(exc)
+    return found
 
 
 class Library:
@@ -102,6 +88,20 @@ class Library:
             return []
         return self.store.status()
 
+    def targets(self):
+        return [item['serial'] for item in self.status()]
+
+    async def register(self, *, ble_id=None, serial=None, timeout=15):
+        identity = await devices.identify(ble_id, serial=serial, timeout=timeout)
+        devices.require_identity(identity, expected=serial)
+        self.save_identity(identity)
+        return identity
+
+    def save_identity(self, identity):
+        devices.require_identity(identity)
+        with writer_lock(self.root):
+            self._writable_store().register_device(identity['serial'], identity['model'])
+
     def import_archive(self, source, metadata=None):
         source = Path(source).expanduser().resolve()
         metadata = Path(metadata).expanduser().resolve() if metadata else Path(str(source) + '.json')
@@ -122,6 +122,8 @@ class Library:
 
     def complete_download(self, serial, previous=0, code=0):
         info = next((d for d in self.status() if d['serial'] == serial), None)
+        if info and info.get('error'):
+            raise RuntimeError(info['error'])
         total = info['committed_records'] if info else 0
         outcome = {'serial': serial, 'status': 'pending' if code else 'empty' if not total else 'downloaded' if total > previous else 'up_to_date',
                    'added_records': total - previous, 'total_records': total,
@@ -132,7 +134,7 @@ class Library:
         events.emit('completed', **outcome)
         return code
 
-    async def download(self, serial, *, execute=False, ble_id=None, timeout=20.0, maxrows=6220, progress_factory=None):
+    async def download(self, serial, *, execute=False, ble_id=None, timeout=20.0, maxrows=6220, progress_factory=None, discovery=None):
         serial = serial_number(serial)
         if timeout <= 0 or maxrows < 1:
             raise ValueError('扫描时间和记录上限必须为正数')
@@ -141,20 +143,20 @@ class Library:
             return 0
         with writer_lock(self.root):
             store = self._writable_store()
-            before = next((d['database_records'] for d in store.status() if d['serial'] == serial), 0)
-            args = SimpleNamespace(serial=serial, ble_id=ble_id, scan_timeout=timeout)
+            try:
+                before = store.device(serial)['row_count']
+            except FileNotFoundError:
+                before = 0
+            args = SimpleNamespace(serial=serial, ble_id=ble_id, scan_timeout=timeout, discovery=discovery)
             from bleak import BleakClient
-            from .errors import DeviceMismatch
             device = await _ble_call(protocol.resolve_ble_device, args)
             events.emit('phase', serial=serial, phase='connecting')
             async def connected():
                 async with BleakClient(device, timeout=30) as client:
                     events.emit('phase', serial=serial, phase='identifying')
-                    actual = (await client.read_gatt_char(protocol.SERIAL_UUID)).decode('utf-8', 'replace').strip('\x00 ')
-                    model = (await client.read_gatt_char(protocol.MODEL_UUID)).decode('utf-8', 'replace').strip('\x00 ')
-                    if actual != serial or 'DROP 3' not in model.upper():
-                        raise DeviceMismatch(f'Serial mismatch or unsupported model: {actual} {model}. No command sent.')
-                    store.ensure_device(serial, model)
+                    identity = await devices.read_identity(client, ble_id=getattr(device, 'address', ble_id))
+                    devices.require_identity(identity, expected=serial, history=True)
+                    store.ensure_device(serial, devices.canonical_model(identity['model']))
                     cursor, pending = store.resume(serial)
                     session = protocol.BleSession(client)
                     await client.start_notify(protocol.UP_UUID, session.callback)
@@ -221,13 +223,21 @@ class Library:
 
 def parser():
     import argparse
-    ap = argparse.ArgumentParser(description='Kestrel DROP D3 一站式下载管理（默认打开中文 TUI）')
+    ap = argparse.ArgumentParser(description='Kestrel DROP 多设备识别与 D3 下载管理（默认打开中文 TUI）')
     ap.add_argument('--data-dir', default=None, help='数据目录；优先使用已保存位置或 KESTREL_DATA_DIR')
     ap.add_argument('--events-json', action='store_true', help='输出版本化 JSON Lines 事件，供 TUI / 自动化使用')
     sub = ap.add_subparsers(dest='command')
     sub.add_parser('tui', help='交互式终端界面')
-    scan = sub.add_parser('scan', help='扫描附近 DROP，不连接或写入设备')
+    scan = sub.add_parser('scan', help='扫描附近 DROP；默认只看广播，可选核验/登记')
     scan.add_argument('--timeout', type=float, default=15)
+    scan.add_argument('--identify', action='store_true', help='逐台连接，只读核验型号与序列号')
+    scan.add_argument('--register', action='store_true', help='逐台核验并登记到本地设备库，不下载历史')
+    for name, help_text in (('identify', '只读查询型号与序列号'), ('register', '只读核验并登记设备')):
+        identity = sub.add_parser(name, help=help_text)
+        selection = identity.add_mutually_exclusive_group(required=True)
+        selection.add_argument('--ble-id')
+        selection.add_argument('--serial', type=serial_number)
+        identity.add_argument('--timeout', type=float, default=15)
     sub.add_parser('list', help='本地档案状态（JSON）')
     sub.add_parser('db', help='只读完整检查：数据库、原始记录与恢复边界')
     sub.add_parser('migrate', help='备份、验证并迁移旧 CSV/SQLite 档案')
@@ -242,8 +252,10 @@ def parser():
     download = sub.add_parser('download', help='首次完整下载或自动增量同步')
     target = download.add_mutually_exclusive_group(required=True)
     target.add_argument('--serial', type=serial_number)
-    target.add_argument('--all', action='store_true', help='依次同步全部本地档案；单设备失败后继续')
-    download.add_argument('--ble-id', help='未命名候选设备的 BLE 地址或 UUID')
+    target.add_argument('--serials', nargs='+', type=serial_number, help='按列表依次采集多个设备')
+    target.add_argument('--all', action='store_true', help='依次处理全部登记设备，含空档案和首次中断；失败后继续')
+    download.add_argument('--ble-id', help='单设备 BLE 地址或 UUID')
+    download.add_argument('--ble-ids', nargs='+', help='与 --serials 一一对应的临时连接地址；- 表示按编号寻找')
     download.add_argument('--timeout', type=float, default=20)
     download.add_argument('--maxrows', type=int, default=6220)
     download.add_argument('--execute', action='store_true', help='执行设备历史读取指令')
@@ -283,7 +295,24 @@ def _run(args):
             from .tui import run
             return run(library)
         if args.command == 'scan':
-            result = asyncio.run(discover(args.timeout))
+            result = asyncio.run(discover(args.timeout, identify=args.identify, register_to=library if args.register else None))
+            if (args.identify or args.register) and any(item.get('identity_error') or not item.get('identity_verified') for item in result):
+                from .errors import DeviceMismatch
+                for item in result:
+                    if item.get('identity_error') or not item.get('identity_verified'):
+                        events.emit('error', serial=item.get('serial'), ble_id=item['ble_id'],
+                            **describe(DeviceMismatch(item.get('identity_error') or str(item.get('identity_errors')))))
+                events.result(result)
+                return 2
+        elif args.command == 'identify':
+            result = asyncio.run(devices.identify(args.ble_id, serial=args.serial, timeout=args.timeout))
+            if not result['identity_verified']:
+                from .errors import DeviceMismatch
+                events.emit('error', **describe(DeviceMismatch('设备型号或编号读取未通过核验：' + str(result['identity_errors']))))
+                events.result(result)
+                return 2
+        elif args.command == 'register':
+            result = asyncio.run(library.register(ble_id=args.ble_id, serial=args.serial, timeout=args.timeout))
         elif args.command in ('list', 'status'):
             result = library.status()
             if getattr(args, 'serial', None):
@@ -314,19 +343,40 @@ def _run(args):
         elif args.command == 'records':
             result = library.records(args.serial, args.limit)
         elif args.command == 'download':
-            if args.all and args.ble_id:
+            if args.ble_ids and (not args.serials or len(args.ble_ids) != len(args.serials)):
+                raise ValueError('--ble-ids 必须与 --serials 数量相同')
+            if (args.all or args.serials) and args.ble_id:
                 raise ValueError('--ble-id 只能用于指定单个 --serial')
-            serials = list(library.archives()) if args.all else [args.serial]
+            requested = library.targets() if args.all else args.serials or [args.serial]
+            addresses = args.ble_ids or [args.ble_id] * len(requested)
+            targets = {}
+            for serial, address in zip(requested, addresses):
+                address = None if address == '-' else address
+                if serial in targets and targets[serial] != address:
+                    raise ValueError('同一编号指定了不同连接地址，请先核验设备身份')
+                targets[serial] = address
+            used_addresses = [v.casefold() for v in targets.values() if v]
+            if len(used_addresses) != len(set(used_addresses)):
+                raise ValueError('不同编号不能共用同一个 BLE 地址')
+            serials = list(targets)
             if not serials:
                 raise ValueError('没有本地档案；先 scan，再使用 download --serial 建立档案')
             failures = []
             outcomes = []
             async def batch():
+                snapshot, scan_error = None, None
+                if args.execute and len(serials) > 1:
+                    try:
+                        snapshot = await devices.scan_snapshot(args.timeout)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        scan_error = exc
                 for serial in serials:
                     try:
+                        if scan_error is not None:
+                            raise scan_error
                         with events.context(serial=serial):
-                            code = await library.download(serial, execute=args.execute, ble_id=args.ble_id,
-                                                          timeout=args.timeout, maxrows=args.maxrows)
+                            code = await library.download(serial, execute=args.execute, ble_id=targets[serial],
+                                                          timeout=args.timeout, maxrows=args.maxrows, discovery=snapshot)
                         outcomes.append(library.download_results.get(serial, {'serial': serial, 'code': code, 'status': 'dry_run'}))
                         if code:
                             failures.append({'serial': serial, 'code': code})
@@ -345,7 +395,7 @@ def _run(args):
             return 0
         events.result(result)
         return 0
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         events.emit('error', **describe(KeyboardInterrupt()))
         print('\n已取消；已落盘的数据会保留。', file=__import__('sys').stderr)
         return 130

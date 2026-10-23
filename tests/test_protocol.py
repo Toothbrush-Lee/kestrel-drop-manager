@@ -113,7 +113,7 @@ class TestConnectionResolution(unittest.IsolatedAsyncioTestCase):
                 return {'test': (known, adv)}
         fake.BleakScanner = Scanner
         args = SimpleNamespace(ble_id=known.address, serial='2866855',scan_timeout=10)
-        with patch.dict(sys.modules, {'bleak': fake}):
+        with patch.dict(sys.modules, {'bleak': fake, 'bleak.exc': SimpleNamespace(BleakError=type('BleakError', (Exception,), {}))}):
             self.assertIs(await resolve_ble_device(args), known)
 
     async def test_fallback_by_advertised_serial_when_uuid_changed(self):
@@ -130,7 +130,7 @@ class TestConnectionResolution(unittest.IsolatedAsyncioTestCase):
                 return {'test': (current, adv)}
         fake.BleakScanner = Scanner
         args = SimpleNamespace(ble_id='OLD-UUID',serial='2866855',scan_timeout=10)
-        with patch.dict(sys.modules, {'bleak': fake}):
+        with patch.dict(sys.modules, {'bleak': fake, 'bleak.exc': SimpleNamespace(BleakError=type('BleakError', (Exception,), {}))}):
             self.assertIs(await resolve_ble_device(args), current)
 
     async def test_no_broadcasts_gives_actionable_error(self):
@@ -145,7 +145,7 @@ class TestConnectionResolution(unittest.IsolatedAsyncioTestCase):
                 return {}
         fake.BleakScanner = Scanner
         args = SimpleNamespace(ble_id='OLD-UUID',serial='2866855',scan_timeout=1)
-        with patch.dict(sys.modules, {'bleak': fake}):
+        with patch.dict(sys.modules, {'bleak': fake, 'bleak.exc': SimpleNamespace(BleakError=type('BleakError', (Exception,), {}))}):
             with self.assertRaisesRegex(RuntimeError, 'No GATT commands were sent'):
                 await resolve_ble_device(args)
 

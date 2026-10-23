@@ -28,6 +28,7 @@ import sys
 import uuid
 
 from .events import emit
+from .devices import model_type
 from .errors import TransferError, DeviceMismatch, BluetoothFailure
 
 SYNC = 0x7E
@@ -672,50 +673,8 @@ def publish_live_files(output: Path, rows: list[dict], metadata: dict) -> None:
 
 
 async def resolve_ble_device(args):
-    """Find D3 right before connecting; return a BLEDevice, never a stale UUID.
-
-    On macOS, providing only a UUID to BleakClient triggers an implicit BLE
-    discovery. Reusing the scanner's BLEDevice is more reliable. We also match
-    the advertised D3 serial name if CoreBluetooth gives a new local UUID.
-    """
-    from bleak import BleakScanner
-
-    emit('phase', serial=args.serial, phase='scanning')
-    advertisements = await BleakScanner.discover(
-        timeout=args.scan_timeout, return_adv=True
-    )
-    target = (args.ble_id or "").casefold()
-    expected_name = f"D3 - {args.serial}"
-    nearby = []
-    exact = []
-    by_serial_name = []
-    for device, adv in advertisements.values():
-        name = (adv.local_name or device.name or '').strip()
-        nearby.append((name, device.address, adv.rssi))
-        if target and device.address.casefold() == target:
-            exact.append(device)
-        elif name.casefold() == expected_name.casefold():
-            by_serial_name.append(device)
-
-    if exact:
-        print(f"Found target in fresh scan: {exact[0].address}")
-        return exact[0]
-    if by_serial_name:
-        print(f"Found {expected_name} under current macOS UUID "
-              f"{by_serial_name[0].address}; previous UUID {args.ble_id} "
-              "will not be used. Device serial is checked before writing.")
-        return by_serial_name[0]
-
-    near_drops = [f"{name or '(unnamed)'} ({address}, {rssi} dBm)"
-                  for name, address, rssi in nearby
-                  if name.lower().startswith(('d2', 'd3'))]
-    details = '; '.join(near_drops[:8]) if near_drops else 'none'
-    raise BluetoothFailure(
-        f"D3 serial {args.serial} not seen during a {args.scan_timeout:g}s "
-        f"BLE scan ({len(nearby)} devices discovered; nearby DROP: {details}). "
-        "Disconnect D3 in iPhone Kestrel LiNK and close the app, move the "
-        "D3 close to the Mac, and retry. No GATT commands were sent."
-    )
+    from .devices import resolve
+    return await resolve(args)
 
 
 # ---------------- Durable incremental CSV synchronization ----------------
@@ -850,7 +809,7 @@ def adopt_archive(output: Path, metadata: Path) -> dict:
         'adopted_from': str(metadata),
         'successful_incremental_syncs': 0,
     }
-    if not state['serial'].isdigit() or 'DROP 3' not in state['model'].upper():
+    if not state['serial'].isdigit() or model_type(state['model']) != 'D3':
         raise RuntimeError('This sync implementation has been tested for D3 only')
     _json_atomic(paths['state'], state)
     return state
@@ -1128,7 +1087,7 @@ async def _sync_live_locked(args):
         emit('phase', serial=args.serial, phase='identifying')
         serial=(await client.read_gatt_char(SERIAL_UUID)).decode('utf-8','replace').strip('\x00 ')
         model=(await client.read_gatt_char(MODEL_UUID)).decode('utf-8','replace').strip('\x00 ')
-        if serial != state['serial'] or 'DROP 3' not in model.upper():
+        if serial != state['serial'] or model_type(model) != 'D3':
             raise DeviceMismatch(f'Connected to an unexpected device: {serial} {model}. No command sent.')
         session=BleSession(client)
         await client.start_notify(UP_UUID,session.callback)
@@ -1243,7 +1202,7 @@ async def _read_connected_d3(client, args, output):
     model=(await client.read_gatt_char(MODEL_UUID)).decode('utf-8','replace').strip('\x00 ')
     if serial!=args.serial:
         raise DeviceMismatch(f'Serial mismatch: expected {args.serial}, connected {serial}. No command sent.')
-    if 'DROP 3' not in model.upper():
+    if model_type(model) != 'D3':
         raise DeviceMismatch(f'Unsupported or unexpected model {model!r}; this D3 parser is not valid for D2')
     session=BleSession(client)
     await client.start_notify(UP_UUID,session.callback)

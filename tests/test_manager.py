@@ -272,7 +272,7 @@ class LibraryTests(unittest.TestCase):
             if serial == '111':
                 raise RuntimeError('unavailable')
             return 0
-        with patch.object(manager.Library, 'archives', return_value={'111': Path('one'), '222': Path('two')}), patch.object(manager.Library, 'download', download):
+        with patch.object(manager.Library, 'targets', return_value=['111', '222']), patch.object(manager.Library, 'download', download), patch.object(manager.devices, 'scan_snapshot', return_value={}):
             self.assertEqual(manager.main(['download', '--all', '--execute']), 2)
         self.assertEqual(calls, ['111', '222'])
 

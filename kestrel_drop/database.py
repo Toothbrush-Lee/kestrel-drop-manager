@@ -17,6 +17,7 @@ import tempfile
 
 from . import protocol
 from .errors import MigrationRequired
+from .devices import canonical_model, model_type, capabilities, serial_number
 
 SCHEMA_VERSION = 2
 APPLICATION_ID = 0x4B445250
@@ -131,13 +132,18 @@ class Store:
         return row
 
     def ensure_device(self, serial, model):
-        if not serial.isascii() or not serial.isdigit() or not 1 <= len(serial) <= 20 or 'DROP 3' not in model.upper():
-            raise RuntimeError('当前仅支持已核验序列号的 DROP D3')
+        if model_type(model) != 'D3':
+            raise RuntimeError('当前仅支持已核验序列号的 DROP D3 历史下载')
+        self.register_device(serial, model)
+
+    def register_device(self, serial, model):
+        serial = serial_number(serial)
+        model = canonical_model(model)
         with self.transaction() as connection:
             old = connection.execute('SELECT model FROM devices WHERE serial=?', (serial,)).fetchone()
             if old:
-                if old['model'] != model:
-                    raise RuntimeError('设备型号与已有档案冲突')
+                if model_type(old['model']) != model_type(model):
+                    raise RuntimeError('同一序列号的设备型号与已有档案冲突，拒绝覆盖')
             else:
                 connection.execute('INSERT INTO devices(serial,model) VALUES(?,?)', (serial, model))
                 connection.execute('INSERT INTO histories(serial) VALUES(?)', (serial,))
@@ -263,7 +269,7 @@ class Store:
         first = next_cursor - len(rows)
         if not rows or first < 0:
             raise RuntimeError('导入记录数量或游标无效')
-        if not serial.isascii() or not serial.isdigit() or not 1 <= len(serial) <= 20 or 'DROP 3' not in model.upper():
+        if not serial.isascii() or not serial.isdigit() or not 1 <= len(serial) <= 20 or model_type(model) != 'D3':
             raise RuntimeError('仅支持 D3 档案导入')
         with self.transaction() as connection:
             if connection.execute('SELECT 1 FROM devices WHERE serial=?', (serial,)).fetchone():
@@ -289,18 +295,24 @@ class Store:
             histories = connection.execute('SELECT h.*, d.model FROM histories h JOIN devices d USING(serial) ORDER BY serial,generation').fetchall()
             for h in histories:
                 count, earliest, latest = connection.execute('SELECT count(*),min(timestamp_device_local),max(timestamp_device_local) FROM observations WHERE history_id=?', (h['id'],)).fetchone()
-                if h['next_cursor'] is None:
-                    pending = connection.execute('SELECT coalesce(sum(length(payload)/21),0) FROM pending_blocks b JOIN transfers t ON t.id=b.transfer_id WHERE history_id=?', (h['id'],)).fetchone()[0]
-                    attempts = connection.execute("SELECT count(*) FROM transfers WHERE history_id=? AND status IN ('receiving','interrupted','superseded')", (h['id'],)).fetchone()[0]
-                    resume = 0
-                else:
-                    rows, resume = self._pending(connection, h)
-                    pending, attempts = len(rows), 0
-                result.append({'serial': h['serial'], 'model': h['model'], 'history_id': h['id'],
-                    'committed_records': count, 'database_records': count, 'pending_records': pending,
-                    'first_cursor': h['first_cursor'], 'next_cursor': h['next_cursor'], 'resume_cursor': resume,
-                    'first_timestamp': earliest, 'last_timestamp': latest, 'initial_attempts': attempts,
-                    'database': str(self.path)})
+                item = {'serial': h['serial'], 'model': h['model'], 'history_id': h['id'],
+                        'committed_records': count, 'database_records': count,
+                        'first_cursor': h['first_cursor'], 'next_cursor': h['next_cursor'],
+                        'first_timestamp': earliest, 'last_timestamp': latest,
+                        'database': str(self.path), 'identity_verified': True,
+                        **capabilities(h['model'])}
+                try:
+                    if h['next_cursor'] is None:
+                        pending = connection.execute('SELECT coalesce(sum(length(payload)/21),0) FROM pending_blocks b JOIN transfers t ON t.id=b.transfer_id WHERE history_id=?', (h['id'],)).fetchone()[0]
+                        attempts = connection.execute("SELECT count(*) FROM transfers WHERE history_id=? AND status IN ('receiving','interrupted','superseded')", (h['id'],)).fetchone()[0]
+                        resume = 0
+                    else:
+                        rows, resume = self._pending(connection, h)
+                        pending, attempts = len(rows), 0
+                    item.update(pending_records=pending, initial_attempts=attempts, resume_cursor=resume)
+                except (RuntimeError, ValueError) as exc:
+                    item.update(error=str(exc), pending_records=None, initial_attempts=0)
+                result.append(item)
         return result
 
     def query(self, serial, *, limit=None, since=None, until=None, end_exclusive=False):
@@ -327,8 +339,10 @@ class Store:
             integrity = [r[0] for r in connection.execute('PRAGMA integrity_check')]
             if integrity != ['ok'] or connection.execute('PRAGMA foreign_key_check').fetchall():
                 raise RuntimeError('数据库完整性或外键检查失败')
-            for h in connection.execute('SELECT * FROM histories'):
+            for h in connection.execute('SELECT h.*,d.model FROM histories h JOIN devices d USING(serial)'):
                 records = connection.execute('SELECT * FROM observations WHERE history_id=? ORDER BY absolute_cursor', (h['id'],)).fetchall()
+                if records and model_type(h['model']) != 'D3':
+                    raise RuntimeError('未支持型号包含历史记录，拒绝套用 D3 解析器')
                 if h['next_cursor'] is None:
                     if records: raise RuntimeError('未初始化历史包含正式记录')
                 elif (len(records) != h['next_cursor'] - h['first_cursor'] or
