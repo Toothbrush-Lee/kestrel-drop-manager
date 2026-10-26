@@ -21,8 +21,8 @@ def validate_event(event):
         'result':('data',), 'sample':('serial','measurements'), 'finished':('code',)}
     if kind not in required or any(key not in event for key in required[kind]):
         raise ValueError('incomplete event')
-    for key in ('serial','phase','message','code','action','status'):
-        if key in event and event[key] is not None and not (kind=='finished' and key=='code') and not isinstance(event[key],str):
+    for key in ('serial','phase','message','action','status'):
+        if key in event and event[key] is not None and not isinstance(event[key],str):
             raise ValueError('invalid text field '+key)
     for key in ('received','expected','added_records','total_records','pending_records'):
         if key in event and (type(event[key]) is not int or event[key]<0):
@@ -33,8 +33,12 @@ def validate_event(event):
             if key=='eta' and value is None: continue
             if type(value) not in (int,float) or not math.isfinite(value) or value<0:
                 raise ValueError('invalid progress '+key)
-    if kind=='error' and type(event['retryable']) is not bool: raise ValueError('invalid retryability')
-    if kind=='finished' and type(event['code']) is not int: raise ValueError('invalid exit status')
+    if kind=='error':
+        if not isinstance(event['code'],str): raise ValueError('invalid error code')
+        if type(event['retryable']) is not bool: raise ValueError('invalid retryability')
+    elif kind in ('completed','finished') and 'code' in event:
+        if type(event['code']) is not int: raise ValueError('invalid exit status')
+        if kind=='completed' and event['code']<0: raise ValueError('invalid completion code')
     return event
 
 
