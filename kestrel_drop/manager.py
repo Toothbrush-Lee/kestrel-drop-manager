@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import csv
 from datetime import datetime, timedelta
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 import os
 from pathlib import Path
@@ -32,7 +32,7 @@ _ble_call = devices.ble_call
 _collection = ContextVar("collection", default=None)
 
 
-async def discover(timeout=5, *, identify=False, register_to=None):
+async def discover(timeout=15, *, identify=False, register_to=None):
     snapshot = await devices.scan_snapshot(timeout)
     found = devices.candidates(snapshot)
     if identify or register_to is not None:
@@ -215,7 +215,8 @@ class Library:
             if not execute: return {'serial':serial,'status':'dry_run','changes':changes,'note':'未访问蓝牙；--execute 后逐项写入并回读验证'}
         if blink and not execute: return {'serial':serial,'status':'dry_run','action':'blink','note':'--execute 后闪灯定位'}
         # One directory owner prevents simultaneous download/configuration of a device.
-        with writer_lock(self.root):
+        owner = _collection.get()
+        with nullcontext() if owner is not None and owner[0] is self else writer_lock(self.root):
             device = await devices.resolve(SimpleNamespace(serial=serial,ble_id=ble_id,scan_timeout=timeout))
             from bleak import BleakClient
             events.emit('phase',serial=serial,phase='connecting')
@@ -305,7 +306,7 @@ def parser():
     sub = ap.add_subparsers(dest='command')
     sub.add_parser('tui', help='交互式终端界面')
     scan = sub.add_parser('scan', help='扫描附近 DROP；默认只看广播，可选核验/登记')
-    scan.add_argument('--timeout', type=float, default=5, help='广播扫描秒数，默认 5；设备较多或信号较弱可设 20')
+    scan.add_argument('--timeout', type=float, default=15, help='广播扫描秒数，默认 15')
     scan.add_argument('--identify', action='store_true', help='逐台连接，只读核验型号与序列号')
     scan.add_argument('--register', action='store_true', help='逐台核验并登记到本地设备库，不下载历史')
     for name, help_text in (('identify', '只读查询型号与序列号'), ('register', '只读核验并登记设备')):
@@ -356,6 +357,15 @@ def parser():
         if command=='live':
             device.add_argument('--samples',type=int,default=1)
             device.add_argument('--period',type=float,default=2)
+    batch = sub.add_parser('set-batch', help='明确选择多台设备逐台配置，默认预演')
+    batch.add_argument('--serials', nargs='+', type=serial_number, required=True)
+    batch.add_argument('--ble-ids', nargs='+')
+    batch.add_argument('--timeout', type=float, default=20)
+    batch.add_argument('--execute', action='store_true')
+    batch.add_argument('--interval', type=int)
+    batch.add_argument('--wrap', choices=('on','off'))
+    batch.add_argument('--update-seconds', type=int)
+    batch.add_argument('--time', help='now 在每台实际写入时取电脑本地时间')
     imp = sub.add_parser('import', help='验证旧完整 CSV 与 .csv.json 并入库，不改源文件')
     imp.add_argument('csv', type=Path)
     imp.add_argument('--metadata', type=Path)
@@ -452,6 +462,17 @@ def _run(args):
             result=asyncio.run(library.device_operation(args.serial,ble_id=args.ble_id,timeout=args.timeout,
                 changes=changes,execute=getattr(args,'execute',False),blink=args.command=='blink',
                 samples=getattr(args,'samples',0),period=getattr(args,'period',2)))
+        elif args.command == 'set-batch':
+            from .batch_settings import targets, configure as configure_batch
+            changes = {key: value for key, value in (
+                ('interval_seconds', args.interval),
+                ('wrap', None if args.wrap is None else args.wrap == 'on'),
+                ('update_seconds', args.update_seconds), ('time', args.time)) if value is not None}
+            selected = targets(args.serials, args.ble_ids)
+            result = asyncio.run(configure_batch(library, selected, changes,
+                                                 execute=args.execute, timeout=args.timeout))
+            events.result(result)
+            return 2 if result['incomplete'] else 0
         elif args.command == 'download':
             if not 1 <= args.parallel <= 8: raise ValueError('并发连接数必须为 1–8')
             if args.ble_ids and (not args.serials or len(args.ble_ids) != len(args.serials)):

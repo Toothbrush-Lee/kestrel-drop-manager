@@ -69,3 +69,31 @@ def retry_download_arguments(arguments, outcomes, failures):
         if flag in arguments: result += [flag, *values(flag)]
     if '--execute' in arguments: result.append('--execute')
     return result
+
+
+def selected_devices(devices, marked):
+    """Resolve an explicit selection atomically; never widen an empty selection."""
+    if not marked:
+        raise ValueError('尚未勾选；空格选择设备，A / Ctrl+A 全选附近设备')
+    by_serial = {item.get('serial'): item for item in devices.values() if item.get('serial')}
+    invalid = [serial for serial in marked if serial not in by_serial or
+               by_serial[serial].get('identity_conflict') or
+               by_serial[serial].get('history_supported') is False]
+    if invalid:
+        raise ValueError('所选设备不可操作，请重新核验或取消勾选：' + '、'.join(sorted(invalid)))
+    return [dict(item) for item in devices.values() if item.get('serial') in marked]
+
+
+def batch_setting_change(action, value, targets):
+    if not targets:
+        raise ValueError('批量设置目标为空')
+    single = setting_change(action.removeprefix('batch_'), value, targets[0])
+    flag = single['arguments'][2:4]
+    single.update(serial=f'{len(targets)} 台所选设备', old='执行时逐台读取，不沿用其他设备旧值',
+                  targets=[dict(item) for item in targets], offset=0, action='set-batch',
+                  arguments=['set-batch', '--serials', *[item['serial'] for item in targets],
+                             '--ble-ids', *[item.get('ble_id') or '-' for item in targets],
+                             *flag, '--execute'])
+    if action == 'batch_set_time' and value == 'now':
+        single['new'] = '每台实际写入时的电脑本地时间（逐台同步）'
+    return single

@@ -1,6 +1,6 @@
 # 命令参考
 
-适用于 0.9.2。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
+适用于 0.10.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
 
 ## 基本约定
 
@@ -17,7 +17,7 @@ uv run kestrel.py --data-dir ~/KestrelData list
 ## 发现与身份
 
 ```bash
-uv run kestrel.py scan                   # 默认 5 秒快扫
+uv run kestrel.py scan                   # 默认 15 秒扫描
 uv run kestrel.py scan --timeout 20      # 较多设备或漏扫时延长
 uv run kestrel.py scan --timeout 20 --identify
 uv run kestrel.py scan --timeout 20 --register
@@ -26,7 +26,7 @@ uv run kestrel.py register --ble-id '扫描得到的地址'
 uv run kestrel.py identify --serial 2509793 --timeout 30
 ```
 
-普通 scan 默认收集 5 秒广播，不连接、不登记；快扫不保证发现全部设备，可重复扫描或显式延长。`--identify` 逐台只读核验；`--register` 核验后额外保存本地登记。identify/register 必须在 `--serial` 和 `--ble-id` 中选一个。D1/D2 广播可能没有编号，用扫描地址读取标准 GATT 身份；地址只是临时连接位置，不能当作永久设备编号。已知地址的配置、身份读取和单台下载定位会在目标广播出现时立即结束；只有编号时仍完整扫描检查重复身份。地址失效时使用同一轮已看到的广播按唯一编号回退，不额外扫描。`--timeout` 是定位等待上限，目标提前出现就提前结束；它不是整个配置操作的总耗时。
+普通 scan 默认收集 15 秒广播，不连接、不登记；可重复扫描或显式延长。`--identify` 逐台只读核验；`--register` 核验后额外保存本地登记。identify/register 必须在 `--serial` 和 `--ble-id` 中选一个。D1/D2 广播可能没有编号，用扫描地址读取标准 GATT 身份；地址只是临时连接位置，不能当作永久设备编号。已知地址的配置、身份读取和单台下载定位会在目标广播出现时立即结束；只有编号时仍完整扫描检查重复身份。地址失效时使用同一轮已看到的广播按唯一编号回退，不额外扫描。`--timeout` 是定位等待上限，目标提前出现就提前结束；它不是整个配置操作的总耗时。
 
 ## 下载与批量地址
 
@@ -39,7 +39,7 @@ uv run kestrel.py download --serials 2509793 2525425 --parallel 2 --execute
 uv run kestrel.py download --all --execute
 ```
 
-`--serial`、`--serials`、`--all` 三选一。`--all` 包括全部本地登记设备、空档案和首次中断项，可能包含离线设备；它不同于 TUI 无勾选时只采集附近设备的策略。
+`--serial`、`--serials`、`--all` 三选一。`--all` 包括全部本地登记设备、空档案和首次中断项，可能包含离线设备；TUI 则始终使用明确勾选；无勾选时 a 不启动，Enter 只处理当前设备。
 
 批量指定地址时，`--ble-ids` 与 `--serials` 必须逐项对应，`-` 表示按编号寻找。整条命令在同一行输入，不能把 UUID 在中间断开。下面有三台设备、三个定位项：
 
@@ -98,6 +98,22 @@ uv run kestrel.py actions 2509793 --limit 20
 
 校时不改变旧历史；now 按执行时电脑本地时间取值。写入取消、断线或失败后，先 device 回读再决定是否重试。actions 保存配置审计；started 不是成功证据。live 的测量不会入历史库，period 是电脑读取间隔，不能保证设备每次产生新值。
 
+## 明确目标的批量设置
+
+```bash
+# 默认预演，不连接蓝牙、不创建数据目录
+uv run kestrel.py set-batch --serials 2509793 2525425 --time now
+# 检查目标与电脑时间后执行；每台实际写入时取当前时间
+uv run kestrel.py set-batch --serials 2509793 2525425 --time now --execute
+uv run kestrel.py set-batch --serials 2509793 2525425 --interval 600 --wrap on --execute
+```
+
+必须显式提供 --serials；不支持 --all，以免把历史离线登记自动纳入配置。可选 --ble-ids 与编号逐项对应，- 表示按编号寻找，--timeout 默认 20 秒。支持 --interval、--wrap、--update-seconds 和 --time，范围与单台一致；不批量改名称和参考海拔。
+
+逐台核验、读取本台旧值、写入、回读并保存独立审计。整批共用目录写锁，单台设备错误继续其他设备，存储等批次级错误会终止。下载并发数不适用于批量设置。配置不是跨设备原子事务，不会自动回滚或重试。
+
+JSON 结果 configurations 逐项列出 verified / failed / dry_run / cancelled_unknown / not_attempted，并返回独立 action_id，校时还返回 time_write_target_local。全部完成退出 0，单台失败退出 2，取消退出 130；取消时尽可能报告已完成、当前结果未知及未执行项。JSON Lines 新增 configured 事件，协议版本仍为 1。失败或取消后先用 device 回读、actions 看审计，再决定是否重新设置。
+
 ## 数据位置、备份、恢复和旧版导入
 
 ```bash
@@ -112,7 +128,7 @@ uv run kestrel.py import '/实际路径/history.csv' --metadata '/实际路径/h
 
 backup 默认写到数据目录/backups，目标文件不能已存在。restore 目标必须为空数据目录，验证后才发布；configure 不搬数据。备份包含数据库内的正式观测、暂存、身份和配置审计，不含 CSV、位置设置或 legacy 原件。
 
-migrate 用于旧 CSV/早期 SQLite，先保存和校验再切换；0.8→0.9 无需迁移。import 只支持本工具旧 D3 完整原始 CSV 及元数据，不是任意 CSV/LiNK 导出的通用导入；同编号已有档案时拒绝覆盖。详细恢复与升级见[用户手册](user-guide.md)。
+migrate 用于旧 CSV/早期 SQLite，先保存和校验再切换；0.8 / 0.9→0.10 无需迁移。import 只支持本工具旧 D3 完整原始 CSV 及元数据，不是任意 CSV/LiNK 导出的通用导入；同编号已有档案时拒绝覆盖。详细恢复与升级见[用户手册](user-guide.md)。
 
 ## 自动化、日志和退出码
 
@@ -120,7 +136,7 @@ migrate 用于旧 CSV/早期 SQLite，先保存和校验再切换；0.8→0.9 �
 uv run kestrel.py --events-json download --serials 2509793 2525425 --parallel 2 --execute > /tmp/kestrel-events.jsonl
 ```
 
-JSON Lines 每行一个事件，带 `version: 1`，包括 phase/progress/log/error/completed/result/sample/finished。需要同时检查每台 completed/error、最终结果和进程退出码。finished 表示命令已结束，不等于全部成功。不要混入普通标准输出或用每一行都当作最终结果。
+JSON Lines 每行一个事件，带 `version: 1`，包括 phase/progress/log/error/completed/configured/result/sample/finished。需要同时检查每台 completed/error、最终结果和进程退出码。finished 表示命令已结束，不等于全部成功。不要混入普通标准输出或用每一行都当作最终结果。
 
 | 退出码 | 含义 |
 | --- | --- |

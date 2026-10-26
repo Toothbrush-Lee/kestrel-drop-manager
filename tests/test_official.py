@@ -18,7 +18,7 @@ from test_devices import Fleet
 
 
 class FakeControl:
-    def __init__(self, *, reject=False, wrong_serial=False, fail_after=0):
+    def __init__(self, *, reject=False, wrong_serial=False, fail_after=0, serial='123'):
         self.writes=[];self.reject=reject;self.fail_after=fail_after;self.audit_check=None
         raw=(300).to_bytes(3,'little')+bytes([1,30,0,1])+b'\0\0'+bytes(range(11))
         self.values={control.SETTINGS_UUID:raw,control.NAME_UUID:b'D2 - 123'.ljust(20,b'\0'),
@@ -33,7 +33,7 @@ class FakeControl:
             async def __aenter__(self):return self
             async def __aexit__(self,*args): pass
             async def read_gatt_char(self,uuid):
-                if uuid==protocol.SERIAL_UUID:return b'999' if wrong_serial else b'123'
+                if uuid==protocol.SERIAL_UUID:return b'999' if wrong_serial else serial.encode()
                 if uuid==protocol.MODEL_UUID:return b'Kestrel DROP 2'
                 return owner.values[uuid]
             async def start_notify(self,uuid,callback):self.callback=callback
@@ -293,7 +293,7 @@ class OfficialUITests(unittest.TestCase):
     def test_parallel_selection_and_invalid_configuration_do_not_launch(self):
         terminal=self.terminal();terminal.handle('j');terminal.form['fields'][0][1]='2';terminal.submit()
         with patch.object(terminal,'start') as start:
-            terminal.handle('a');self.assertIn('--parallel',start.call_args.args[1]);self.assertEqual(start.call_args.args[1][-1],'2')
+            terminal.handle('A');terminal.handle('a');self.assertIn('--parallel',start.call_args.args[1]);self.assertEqual(start.call_args.args[1][-1],'2')
         terminal.device_state={'serial':'123','settings':{}}
         terminal.handle('4');terminal.form['fields'][0][1]='中文'
         with patch.object(terminal,'start') as start:terminal.submit();start.assert_not_called()

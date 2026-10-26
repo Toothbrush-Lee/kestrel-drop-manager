@@ -68,14 +68,14 @@ async def ble_call(operation, *args, **kwargs):
         raise BluetoothFailure(f'蓝牙操作失败：{exc}。请断开手机 LiNK，检查蓝牙开关和终端权限，然后重试。') from exc
 
 
-async def scan_snapshot(timeout=5):
+async def scan_snapshot(timeout=15):
     if timeout <= 0: raise ValueError('扫描时间必须大于 0')
     from bleak import BleakScanner
     events.emit('phase', phase='scanning')
     return await ble_call(BleakScanner.discover, timeout=timeout, return_adv=True)
 
 
-async def scan(timeout=5):
+async def scan(timeout=15):
     return candidates(await scan_snapshot(timeout))
 
 

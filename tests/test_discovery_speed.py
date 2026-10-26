@@ -60,14 +60,14 @@ class TargetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ScanControlsTests(unittest.TestCase):
-    def test_cli_quick_default_and_explicit_long_scan(self):
-        self.assertEqual(manager.parser().parse_args(['scan']).timeout,5)
+    def test_cli_standard_scan_and_explicit_timeout(self):
+        self.assertEqual(manager.parser().parse_args(['scan']).timeout,15)
         self.assertEqual(manager.parser().parse_args(['scan','--timeout','20']).timeout,20)
-    def test_tui_quick_and_long_scan_are_explicit(self):
+    def test_tui_has_one_standard_scan(self):
         terminal=Terminal(FakeScreen(),manager.Library('/tmp/kestrel-scan-ui-model-only'))
         with patch.object(terminal,'start') as start:
             terminal.handle('s');start.assert_called_once_with('scan',['scan'])
-            start.reset_mock();terminal.handle('S');start.assert_called_once_with('scan',['scan','--timeout','20'])
+            start.reset_mock();terminal.handle('S');start.assert_called_once_with('scan',['scan'])
     def test_settings_pass_existing_scan_address(self):
         terminal=Terminal(FakeScreen(),manager.Library('/tmp/kestrel-scan-ui-model-only'))
         terminal.devices={'123':{'serial':'123','ble_id':'abc','nearby':True}}

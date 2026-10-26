@@ -363,7 +363,7 @@ class MultiDeviceUI(unittest.TestCase):
         self.assertIn('型号',text)
         for kind in ('D1','D2','D3'): self.assertIn(kind,text)
         self.assertIn('待核验',text)
-        self.assertIn('a 采集',text)
+        self.assertIn('a 下载',text)
 
     def test_d1_preview_renders_absent_measurements(self):
         terminal=self.terminal({})
@@ -385,10 +385,10 @@ class MultiDeviceUI(unittest.TestCase):
             terminal.handle('a')
             start.assert_called_once_with('download',['download','--serials','1','--ble-ids','a','--execute'])
 
-    def test_unmarked_batch_includes_new_scanned_devices(self):
+    def test_select_all_then_download_includes_new_scanned_devices(self):
         terminal=self.terminal({'1':{'serial':'1','nearby':True},'2':{'serial':'2','ble_id':'b','nearby':True}})
         with patch.object(terminal,'start') as start:
-            terminal.handle('a')
+            terminal.handle('A');terminal.handle('a')
             start.assert_called_once_with('download',['download','--serials','1','2','--ble-ids','-','b','--execute'])
 
     def test_default_batch_excludes_offline_and_unsupported_devices(self):
@@ -397,10 +397,9 @@ class MultiDeviceUI(unittest.TestCase):
             '3':{'serial':'3','nearby':False,'device_type':'D3','history_supported':True},
             '4':{'serial':'4','nearby':True,'device_type':'D3','history_supported':True,'ble_id':'four'}})
         with patch.object(terminal,'start') as start:
-            terminal.handle('a')
+            terminal.handle('A');terminal.handle('a')
             start.assert_called_once_with('download',['download','--serials','4','--ble-ids','four','--execute'])
-        self.assertIn('历史待适配',''.join(terminal.logs))
-        self.assertIn('本次未扫描到',''.join(terminal.logs))
+        self.assertEqual(terminal.marked,{'4'})
 
     def test_explicitly_marked_offline_device_can_still_be_retried(self):
         terminal=self.terminal({'1':{'serial':'1','nearby':False,'history_supported':True}})
@@ -414,7 +413,7 @@ class MultiDeviceUI(unittest.TestCase):
         terminal.marked={'1'}
         with patch.object(terminal,'start') as start:
             terminal.handle('a'); start.assert_not_called()
-        self.assertIn('没有可采集目标',terminal.message)
+        self.assertIn('不可操作',terminal.message)
 
     def test_unsupported_single_download_shows_explanation_without_ble_write(self):
         terminal=self.terminal({'1':{'serial':'1','device_type':'D1','history_supported':False}})

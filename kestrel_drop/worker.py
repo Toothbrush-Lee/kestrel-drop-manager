@@ -18,7 +18,7 @@ def validate_event(event):
         'phase':('phase',), 'progress':('received','expected','rate','elapsed','eta'),
         'log':('message',), 'error':('code','message','action','retryable'),
         'completed':('serial','status','added_records','total_records','pending_records'),
-        'result':('data',), 'sample':('serial','measurements'), 'finished':('code',)}
+        'configured':('serial','status'), 'result':('data',), 'sample':('serial','measurements'), 'finished':('code',)}
     if kind not in required or any(key not in event for key in required[kind]):
         raise ValueError('incomplete event')
     for key in ('serial','phase','message','action','status'):
@@ -56,6 +56,12 @@ def validate_result(action, data):
                 raise ValueError('invalid device outcome')
             for key in ('added_records','total_records','pending_records'):
                 if key in item and (type(item[key]) is not int or item[key]<0): raise ValueError('invalid result count')
+    if action=='set-batch':
+        outcomes=data.get('configurations')
+        if not isinstance(outcomes,list): raise ValueError('missing configuration outcomes')
+        for item in outcomes:
+            if not isinstance(item,dict) or not isinstance(item.get('serial'),str) or item.get('status') not in ('verified','failed','dry_run','cancelled_unknown','not_attempted'):
+                raise ValueError('invalid configuration outcome')
     if action=='set' and (not isinstance(data.get('before'),dict) or not isinstance(data.get('after'),dict)):
         raise ValueError('configuration result lacks before/after state')
     return data
