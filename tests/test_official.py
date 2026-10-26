@@ -284,7 +284,10 @@ class OfficialUITests(unittest.TestCase):
         terminal.handle('1');self.assertEqual(terminal.form['action'],'set_interval')
         terminal.form['fields'][0][1]='600'
         with patch.object(terminal,'start') as start:
-            terminal.submit();start.assert_called_once_with('set',['set','123','--interval','600','--execute','--ble-id','a'])
+            terminal.submit();start.assert_not_called()
+            self.assertEqual(terminal.review['new'],'10 分钟（600 秒）')
+            terminal.handle('\n')
+            start.assert_called_once_with('set',['set','123','--interval','600','--execute','--ble-id','a'])
         self.assertIsNone(terminal.form)
 
     def test_parallel_selection_and_invalid_configuration_do_not_launch(self):

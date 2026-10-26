@@ -8,40 +8,25 @@ from __future__ import annotations
 from collections import deque
 import curses
 import json
-import os
-from pathlib import Path
 import queue
-import signal
 import subprocess
 import sys
-import threading
+from datetime import datetime
 import time
-import unicodedata
 
 from . import __version__
 from .protocol import TransferProgress
 from .errors import TITLES
 from .devices import model_type
+from .worker import Job
+from .ui_text import clip, text_width, wrap_lines, input_window
+from .ui_actions import format_interval, setting_change, retry_download_arguments
 
 PHASES = {'scanning': '扫描附近设备', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
           'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
           'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库'}
 STATUSES = {'downloaded': '已保存', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
             'empty': '设备暂无记录', 'failed': '未完成', 'dry_run': '仅预演'}
-
-
-def clip(text, width):
-    """Clip by terminal cells instead of splitting Chinese wide characters."""
-    result, used = [], 0
-    for char in str(text):
-        if unicodedata.category(char).startswith('C'):
-            char = ' '
-        size = 0 if unicodedata.combining(char) else (2 if unicodedata.east_asian_width(char) in 'WF' else 1)
-        if used + size > width:
-            break
-        result.append(char)
-        used += size
-    return ''.join(result)
 
 
 def merge_devices(current, incoming, *, scan=False):
@@ -82,74 +67,6 @@ def merge_devices(current, incoming, *, scan=False):
     return result
 
 
-class Job:
-    def __init__(self, root, arguments):
-        self.events = queue.Queue()
-        self.cancelled = False
-        self.arguments = list(arguments)
-        self.payload = None
-        self.failures = []
-        self.outcomes = []
-        self.protocol_error = False
-        self.finished = False
-        self.process = subprocess.Popen(
-            [sys.executable, '-u', str(Path(__file__).resolve().parents[1] / 'kestrel.py'),
-             '--data-dir', str(root), '--events-json', *arguments],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding='utf-8', errors='replace', bufsize=1,
-            env={**os.environ, 'PYTHONUNBUFFERED': '1'},
-        )
-        self.thread = threading.Thread(target=self._read, daemon=True)
-        self.thread.start()
-
-    def _read(self):
-        def errors():
-            try:
-                for line in self.process.stderr:
-                    self.events.put(('stderr', line.rstrip()))
-            finally:
-                self.process.stderr.close()
-        error_thread = threading.Thread(target=errors, daemon=True)
-        error_thread.start()
-        try:
-            for line in self.process.stdout:
-                try:
-                    event = json.loads(line)
-                    if not isinstance(event, dict) or event.get('version') != 1 or event.get('event') not in (
-                            'phase', 'progress', 'log', 'error', 'completed', 'result', 'sample', 'finished'):
-                        raise ValueError('unknown event schema')
-                    if event['event'] == 'finished':
-                        self.finished = True
-                    self.events.put(('event', event))
-                except (ValueError, TypeError):
-                    self.protocol_error = True
-                    self.events.put(('stderr', '后台事件格式错误：' + line.rstrip()))
-        finally:
-            self.process.stdout.close()
-            code = self.process.wait()
-            error_thread.join()
-            self.events.put(('exit', 2 if code == 0 and (self.protocol_error or not self.finished) else code))
-
-    def cancel(self):
-        if self.process.poll() is None:
-            self.cancelled = True
-            try:
-                self.process.send_signal(signal.SIGINT)
-            except ProcessLookupError:
-                pass  # The child may exit between poll() and send_signal().
-
-    def close(self):
-        self.cancel()
-        try:
-            self.process.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        self.thread.join(timeout=1)
 
 
 class Terminal:
@@ -172,6 +89,7 @@ class Terminal:
         self.text_offset = 0
         self.result_view = None
         self.device_state = None
+        self.review = None
         self.device_progress = {}
         self.parallel = 1
         self.last_stamp = None
@@ -189,7 +107,7 @@ class Terminal:
     def refresh_if_changed(self):
         if time.monotonic() < self.next_local_refresh: return
         self.next_local_refresh=time.monotonic()+2
-        if self.job or self.form or self.preview is not None or self.text_view is not None or self.result_view is not None or self.device_state is not None: return
+        if self.job or self.form or self.preview is not None or self.text_view is not None or self.result_view is not None or self.device_state is not None or self.review is not None: return
         if self.last_stamp is not None and self.database_stamp()!=self.last_stamp:
             self.refresh_message='本地数据已更新（自动刷新）'
             self.start('list',['list'])
@@ -197,15 +115,22 @@ class Terminal:
     def start(self, action, arguments):
         if self.job:
             self.message = '任务执行中；按 c 取消，或等待完成'
-            return
+            return False
         if action=='list': self.list_stamp=self.database_stamp()
         if action=='download': self.device_progress={}
         self.action = action
         self.progress = ''
-        self.job = Job(self.library.root, arguments)
+        try:
+            self.job = Job(self.library.root, arguments)
+        except OSError as exc:
+            self.action=None
+            self.message=f'无法启动后台任务：{exc}'
+            self.logs.append(self.message)
+            return False
         self.message = {'scan': '正在扫描蓝牙广播…', 'list': '正在读取本地档案…',
                         'download': '正在连接设备；c 可取消并保留已落盘数据…'}.get(action, '正在处理…')
         self.logs.append('> ' + ' '.join(arguments))
+        return True
 
     def poll(self):
         if not self.job:
@@ -256,6 +181,7 @@ class Terminal:
                     elif action in ('device','set'):
                         self.device_state = payload if action=='device' else {**payload['before'],**payload['after']}
                         self.message = '设置已回读验证' if action=='set' else '设备信息已读取；不会自动校时'
+                        self.device_state['read_stale']=False
                     elif action == 'blink':
                         self.message = '已发送闪灯定位，请观察设备 LED'
                     elif action == 'live':
@@ -300,7 +226,7 @@ class Terminal:
                 if action in ('set','blink'):
                     for failure in failures: failure['retryable']=False
                 self.result_view = {'outcomes': outcomes, 'failures': failures, 'code': value,
-                                    'action': action, 'arguments': job.arguments}
+                                    'action': action, 'arguments': job.arguments, 'selected':0}
                 if len(outcomes) == 1 and outcomes[0]['serial'] in self.devices:
                     self.selected = list(self.devices).index(outcomes[0]['serial'])
             return
@@ -319,7 +245,7 @@ class Terminal:
                              f'预计剩余 {TransferProgress.duration(event["eta"])}')
         elif kind == 'result':
             self.job.payload = event['data']
-            if self.action in ('export', 'backup', 'import', 'migrate', 'configure', 'register', 'identify'):
+            if self.action in ('export', 'backup', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set'):
                 self.logs.append('结果：' + json.dumps(event['data'], ensure_ascii=False))
         elif kind == 'completed':
             for item in self.devices.values():
@@ -339,7 +265,9 @@ class Terminal:
 
     def open_form(self, title, fields, action):
         self.form = {'title': title, 'fields': [[label, str(value)] for label, value in fields],
-                     'index': 0, 'action': action, 'error': ''}
+                     'index': 0, 'action': action, 'error': '',
+                     'cursors': [len(str(value)) for _,value in fields],
+                     'target': self.device_state['serial'] if action.startswith('set_') and self.device_state else (self.selected_device() or {}).get('serial')}
 
     def submit(self):
         values = [field[1].strip() for field in self.form['fields']]
@@ -350,15 +278,8 @@ class Terminal:
                 if not 1 <= value <= 8: raise ValueError('并发连接数必须为 1–8，建议从 2 开始')
                 self.parallel=value;self.message=f'本次批量并发上限：{value}'
             elif action.startswith('set_'):
-                from .control import validate_changes
-                mapping={'set_interval':('interval_seconds','--interval',int),'set_wrap':('wrap','--wrap',lambda v: v=='on' if v in ('on','off') else None),
-                    'set_name':('name','--name',str),'set_time':('time','--time',str),'set_update':('update_seconds','--update-seconds',int),
-                    'set_altitude':('reference_altitude_m','--reference-altitude',int)}
-                field,flag,convert=mapping[action]
-                validate_changes({field:convert(values[0])})
-                args=['set',self.device_state['serial'],flag,values[0],'--execute']
-                if self.device_state.get('ble_id'): args += ['--ble-id',self.device_state['ble_id']]
-                self.start('set',args)
+                self.review=setting_change(action,values[0],self.device_state)
+                return
             elif action == 'add':
                 from .manager import serial_number
                 serial = serial_number(values[0])
@@ -369,136 +290,180 @@ class Terminal:
             elif action == 'import':
                 if not values[0]:
                     raise ValueError('请输入 CSV 路径')
-                self.start('import', ['import', values[0]] + (['--metadata', values[1]] if values[1] else []))
+                if self.start('import', ['import', values[0]] + (['--metadata', values[1]] if values[1] else [])) is False:
+                    self.form['error']=self.message
+                    return
             elif action == 'configure':
                 if not values[0]:
                     raise ValueError('请输入数据目录')
-                self.start('configure', ['configure', values[0]])
+                if self.start('configure', ['configure', values[0]]) is False:
+                    self.form['error']=self.message
+                    return
             elif action == 'export':
                 if not values[0]:
                     raise ValueError('请输入导出路径')
-                args = ['export', self.selected_device()['serial'], values[0]]
+                args = ['export', self.form['target'], values[0]]
                 if values[1]:
                     args += ['--since', values[1]]
                 if values[2]:
                     args += ['--until', values[2]]
-                self.start('export', args)
+                if self.start('export', args) is False:
+                    self.form['error']=self.message
+                    return
             self.form = None
         except (ValueError, OSError) as exc:
             self.form['error'] = str(exc)
 
     def handle_form(self, key):
-        form = self.form
-        if key == '\x1b':
-            self.form = None
-        elif key in ('\t', curses.KEY_DOWN):
-            form['index'] = (form['index'] + 1) % len(form['fields'])
-        elif key in (curses.KEY_BTAB, curses.KEY_UP):
-            form['index'] = (form['index'] - 1) % len(form['fields'])
-        elif key in ('\n', '\r', curses.KEY_ENTER):
-            if form['index'] + 1 < len(form['fields']):
-                form['index'] += 1
-            else:
-                self.submit()
-        elif key in ('\b', '\x7f', curses.KEY_BACKSPACE):
-            form['fields'][form['index']][1] = form['fields'][form['index']][1][:-1]
-        elif key == '\x15':
-            form['fields'][form['index']][1] = ''
-        elif isinstance(key, str) and key.isprintable():
-            form['fields'][form['index']][1] += key
+        form=self.form
+        index=form['index']
+        positions=form.setdefault('cursors',[len(field[1]) for field in form['fields']])
+        value=form['fields'][index][1]
+        cursor=max(0,min(positions[index],len(value)))
+        if key=='\x1b': self.form=None
+        elif key in ('\t',curses.KEY_DOWN): form['index']=(index+1)%len(form['fields'])
+        elif key in (curses.KEY_BTAB,curses.KEY_UP): form['index']=(index-1)%len(form['fields'])
+        elif key in ('\n','\r',curses.KEY_ENTER):
+            if index+1<len(form['fields']): form['index']+=1
+            else: self.submit()
+        elif key==curses.KEY_LEFT: cursor=max(0,cursor-1)
+        elif key==curses.KEY_RIGHT: cursor=min(len(value),cursor+1)
+        elif key==curses.KEY_HOME: cursor=0
+        elif key==curses.KEY_END: cursor=len(value)
+        elif key in ('\b','\x7f',curses.KEY_BACKSPACE):
+            if cursor: value=value[:cursor-1]+value[cursor:];cursor-=1
+        elif key==curses.KEY_DC: value=value[:cursor]+value[cursor+1:]
+        elif key=='\x15': value='';cursor=0
+        elif isinstance(key,str) and key.isprintable(): value=value[:cursor]+key+value[cursor:];cursor+=len(key)
+        # submit() can replace the current overlay, so update only its original buffer.
+        if self.form is form and self.review is None:
+            form['fields'][index][1]=value
+            positions[index]=cursor
+
+    def open_text(self, mode):
+        self.text_view=[]
+        if mode=='l':
+            for entry in self.logs: self.text_view.extend(str(entry).splitlines() or [''])
+            self.text_view=self.text_view or ['暂无日志']
+            self.text_offset=max(0,len(self.wrapped_text())-self.screen.getmaxyx()[0]+4)
+        else:
+            self.text_view=[
+                '快速开始：s 扫描 → ↑↓ 选择 → Enter 下载 → e 导出。',
+                '首次读取最早仍保留的历史，以后只下载新增；设备中的旧记录不会自动删除。',
+                '编号未知：选择该行按 x 连接核验；已知编号仍会在下载前再次核对。',
+                '批量：空格勾选，Ctrl+A 勾选本次附近可采集项，u 清空勾选，a 开始。',
+                '没有勾选时，a 只处理本次扫描到的可采集设备；离线档案仍保留。',
+                'j 设置本次并发数；默认 1，建议先尝试 2，更多连接数需现场验证。',
+                '列表和结果：↑↓ / PgUp / PgDn / Home / End 导航，结果页 r 只重试未完成项。',
+                'g 读取设备设置；1–6 修改单项 → Enter 查看变更 → 再 Enter 写入。',
+                '配置页 r 重新读取，w 读实时测量，f 闪灯定位，b 仍是数据库备份。',
+                '配置结果不确定时先 r 回读；校时只影响之后的记录，不改写历史。',
+                'c 取消任务；主界面 q 取消并退出；其他页面 Esc 返回上一层。',
+                'v 预览最近记录；e 导出 CSV；b 备份 SQLite（含续传和配置审计）。',
+                'r 刷新本地档案；空闲主界面也会感知外部数据库更新，不会自动连接蓝牙。',
+                'o 打开数据目录；p 保存位置，不自动搬动旧数据；m 迁移，i 导入旧 D3 原始档案。',
+                '已入库可查询导出；未确认已落盘但尚未完成。首次中断会完整重读，增量可续传。',
+                '完整说明：docs/user-guide.md；CLI：docs/cli.md；开发：docs/development.md。']
+            self.text_offset=0
+
+    def wrapped_text(self):
+        width=max(1,self.screen.getmaxyx()[1]-3)
+        return [line for source in self.text_view or [] for line in wrap_lines(source,width)]
+
+    def handle_result(self, key):
+        view=self.result_view
+        outcomes=view['outcomes']
+        selected=min(view.get('selected',0),max(0,len(outcomes)-1))
+        step=max(1,self.screen.getmaxyx()[0]-13)
+        if key in ('\n','\r','\x1b','q'): self.result_view=None
+        elif key==curses.KEY_DOWN: selected=min(max(0,len(outcomes)-1),selected+1)
+        elif key==curses.KEY_UP: selected=max(0,selected-1)
+        elif key==curses.KEY_NPAGE: selected=min(max(0,len(outcomes)-1),selected+step)
+        elif key==curses.KEY_PPAGE: selected=max(0,selected-step)
+        elif key==curses.KEY_HOME: selected=0
+        elif key==curses.KEY_END: selected=max(0,len(outcomes)-1)
+        elif key=='r' and any(f.get('retryable') for f in view['failures']) and not self.job:
+            args=retry_download_arguments(view['arguments'],outcomes,view['failures']) if view['action']=='download' else view['arguments']
+            if args is None: self.message='所有可重试项均已保存；其余问题请核对后从列表选择'
+            elif self.start(view['action'],args) is not False: self.result_view=None
+        elif key in ('v','e','b') and not self.job:
+            if outcomes and outcomes[selected]['serial'] in self.devices:
+                self.selected=list(self.devices).index(outcomes[selected]['serial'])
+            self.result_view=None
+            self.device_state=None
+            return self.handle(key)
+        view['selected']=selected
+        return True
 
     def handle(self, key):
         if self.job and key=='c':
             self.job.cancel()
             self.message='正在取消；配置可能部分生效，请在取消后重新读取' if self.action in ('set','blink') else '正在取消，等待连接清理'
             return True
+        if self.review is not None:
+            if key in ('\x1b','q'): self.review=None
+            elif key in ('\n','\r',curses.KEY_ENTER):
+                if self.start('set',self.review['arguments']) is not False:
+                    self.review=None;self.form=None
+                    self.device_state['read_stale']=True
+                else: self.review['error']=self.message
+            return True
         if self.form:
             self.handle_form(key)
+            return True
+        if self.text_view is not None:
+            total=len(self.wrapped_text())
+            step=max(1,self.screen.getmaxyx()[0]-4)
+            if key in ('q','\x1b','\n','\r'): self.text_view=None
+            elif key in (curses.KEY_DOWN,curses.KEY_NPAGE): self.text_offset=min(max(0,total-1),self.text_offset+(step if key==curses.KEY_NPAGE else 1))
+            elif key in (curses.KEY_UP,curses.KEY_PPAGE): self.text_offset=max(0,self.text_offset-(step if key==curses.KEY_PPAGE else 1))
+            elif key==curses.KEY_HOME:self.text_offset=0
+            elif key==curses.KEY_END:self.text_offset=max(0,total-step)
+            return True
+        if key in ('?','l'):
+            self.open_text(key)
+            return True
+        if self.result_view is not None: return self.handle_result(key)
+        if self.preview is not None:
+            if key in ('q','\x1b','\n','\r'): self.preview=None
+            elif key in (curses.KEY_DOWN,curses.KEY_NPAGE): self.preview_offset=min(max(0,len(self.preview)-1),self.preview_offset+(max(1,self.screen.getmaxyx()[0]-5) if key==curses.KEY_NPAGE else 1))
+            elif key in (curses.KEY_UP,curses.KEY_PPAGE): self.preview_offset=max(0,self.preview_offset-(max(1,self.screen.getmaxyx()[0]-5) if key==curses.KEY_PPAGE else 1))
+            elif key==curses.KEY_HOME:self.preview_offset=0
+            elif key==curses.KEY_END:self.preview_offset=max(0,len(self.preview)-max(1,self.screen.getmaxyx()[0]-5))
             return True
         if self.device_state is not None and self.result_view is None:
             if key in ('q','\x1b','\n','\r'):
                 if not self.job: self.device_state=None
+                else: self.message='任务仍在进行；c 取消，完成后 Esc 返回'
                 return True
             if self.job: return True
             state=self.device_state;settings=state.get('settings') or {}
-            forms={'1':('采样间隔：输入秒数（2,5,10,20,30,60,120,300,360,600,1200,1800,3600,7200,21600,43200）',settings.get('interval_seconds') or 300,'set_interval'),
+            forms={'1':('设置采样间隔（秒）',settings.get('interval_seconds') or 300,'set_interval'),
                    '2':('滚动覆盖：on 覆盖最早记录 / off 满后停止记录','on' if settings.get('wrap') else 'off','set_wrap'),
                    '3':('校时：输入设备本地时间或 now；不会修改旧记录','now','set_time'),
                    '4':('设备名称：1–20 个可打印 ASCII 字符',state.get('name') or '','set_name'),
                    '5':('实时更新间隔：2–60 秒',settings.get('update_seconds') or 30,'set_update'),
                    '6':('气压计算参考海拔：米',settings.get('reference_altitude_m') or 0,'set_altitude')}
-            if key=='6' and (state.get('device_type') or model_type(state.get('model')))!='D3':
+            if key in forms and state.get('read_stale'):
+                self.message='上次修改结果未确认，请先按 r 重新读取设备设置'
+            elif key=='6' and (state.get('device_type') or model_type(state.get('model')))!='D3':
                 self.message='此型号没有气压测量，无需配置参考海拔'
+            elif key in {'1','2','5','6'} and settings.get({'1':'interval_seconds','2':'wrap','5':'update_seconds','6':'reference_altitude_m'}[key]) is None:
+                self.message='此设置未读到或设备不支持，请先按 r 重新读取'
             elif key in forms:
-                title,value,action=forms[key];self.open_form(title,[('新值（Enter 写入并回读）',value)],action)
-            elif key in ('r','w','b'):
-                action={'r':'device','w':'live','b':'blink'}[key]
+                title,value,action=forms[key];self.open_form(title,[('新值（Enter 查看变更）',value)],action)
+            elif key=='b': self.start('backup',['backup'])
+            elif key in ('r','w','f'):
+                action={'r':'device','w':'live','f':'blink'}[key]
                 args=[action,state['serial']]
                 if state.get('ble_id'):args+=['--ble-id',state['ble_id']]
                 if action=='blink':args+=['--execute']
                 self.start(action,args)
             return True
-        if self.text_view is not None:
-            if key in ('q', '\x1b', '\n'):
-                self.text_view = None
-            elif key in (curses.KEY_DOWN, curses.KEY_NPAGE):
-                self.text_offset = min(max(0, len(self.text_view) - 1), self.text_offset + (10 if key == curses.KEY_NPAGE else 1))
-            elif key in (curses.KEY_UP, curses.KEY_PPAGE):
-                self.text_offset = max(0, self.text_offset - (10 if key == curses.KEY_PPAGE else 1))
+        if key=='\x1b':
+            self.message='已在设备列表；按 q 退出'
             return True
-        if self.preview is not None:
-            if key in ('q', '\x1b', '\n'):
-                self.preview = None
-            elif key == curses.KEY_DOWN:
-                self.preview_offset = min(max(0, len(self.preview) - 1), self.preview_offset + 1)
-            elif key == curses.KEY_UP:
-                self.preview_offset = max(0, self.preview_offset - 1)
-            return True
-        if self.result_view is not None:
-            view = self.result_view
-            if key in ('\n', '\r', '\x1b', 'q'):
-                self.result_view = None
-            elif key == 'r' and any(failure.get('retryable') for failure in view['failures']):
-                if not self.job:
-                    self.result_view = None
-                    self.start(view['action'], view['arguments'])
-            elif key in ('v', 'e', 'b', 'l'):
-                if self.job:
-                    return True
-                self.result_view = None
-                return self.handle(key)
-            return True
-        if key in ('?', 'l'):
-            if key == 'l':
-                width = max(20, self.screen.getmaxyx()[1] - 3)
-                lines = []
-                for entry in self.logs:
-                    while entry:
-                        part = clip(entry, width)
-                        lines.append(part)
-                        entry = entry[len(part):]
-                self.text_view = lines or ['暂无日志']
-                self.text_offset = max(0, len(self.text_view) - self.screen.getmaxyx()[0] + 4)
-            else:
-                self.text_view = [
-                    's 扫描 D1/D2/D3 广播；x 只读核验编号并登记，扫描名称仅作提示。',
-                    '首次下载自动建档；以后使用保存的绝对游标，仅同步新增记录。',
-                    '空格勾选设备；a 采集可支持的勾选项，无勾选时只处理本次附近设备。',
-                    'c 取消当前任务；q 取消并退出。已落盘数据保留。',
-                    'n 手动输入序列号；未命名候选设备可同时指定 BLE UUID。',
-                    'i 导入原始完整 CSV 与 .csv.json，源文件保留。',
-                    'v 从 SQLite 预览最新记录；e 导出 CSV，支持起止时间筛选。',
-                    'b 备份数据库到数据目录/backups/，包括下载恢复进度。',
-                    'm 迁移旧档案，先备份核验；p 保存数据位置（不搬动已有数据）；o 打开文件夹。',
-                    'r 只读刷新本地档案；l 查看日志，↑↓ / PgUp / PgDn 滚动。',
-                    '首次下载中断：保留在数据库，下次重新读取完整历史。',
-                    '增量下载中断：数据库保留待确认块，下次从绝对游标恢复。',
-                    'D1/D2/D3 按官方协议解析；g 查看配置，j 设置批量并发数。',
-                    '设备时间没有时区；结束日期只写日期时包含当天整天。',
-                ]
-                self.text_offset = 0
-            return True
-        if key in ('q', '\x1b'):
+        if key=='q':
             if self.job:
                 self.job.cancel()
                 self.quit_after_cancel = True
@@ -512,9 +477,20 @@ class Terminal:
             self.selected = min(max(0, len(self.devices) - 1), self.selected + 1)
         elif key == curses.KEY_UP:
             self.selected = max(0, self.selected - 1)
+        elif key in (curses.KEY_NPAGE,curses.KEY_PPAGE,curses.KEY_HOME,curses.KEY_END):
+            step=max(2,min(8,self.screen.getmaxyx()[0]-15))
+            if key==curses.KEY_NPAGE:self.selected=min(max(0,len(self.devices)-1),self.selected+step)
+            elif key==curses.KEY_PPAGE:self.selected=max(0,self.selected-step)
+            elif key==curses.KEY_HOME:self.selected=0
+            else:self.selected=max(0,len(self.devices)-1)
         elif not self.job:
             device = self.selected_device()
-            if key == 'j':
+            if key=='u':
+                self.marked.clear();self.message='已清空勾选；a 将处理本次附近设备'
+            elif key=='\x01':
+                self.marked={item['serial'] for item in self.devices.values() if item.get('serial') and item.get('nearby') and not item.get('identity_conflict') and item.get('history_supported') is not False}
+                self.message=f'已勾选 {len(self.marked)} 台附近可采集设备'
+            elif key == 'j':
                 self.open_form('设置本次批量并发数（1–8，建议从 2 开始）',[('并发数',self.parallel)],'parallel')
             elif key == 'g':
                 if not device or not device.get('serial'): self.message='先扫描并按 x 核验编号'
@@ -552,7 +528,7 @@ class Terminal:
                     serial = device['serial']
                     if serial in self.marked: self.marked.remove(serial)
                     else: self.marked.add(serial)
-                    self.message = f'已勾选 {len(self.marked)} 台；按 a 依次采集'
+                    self.message = f'已勾选 {len(self.marked)} 台；按 a 以并发 {self.parallel} 采集'
                 else:
                     self.message = '请先用 x 读取编号；重复编号需先核验'
             elif key == 'n':
@@ -625,140 +601,198 @@ class Terminal:
 
     def draw(self):
         self.screen.erase()
-        height, width = self.screen.getmaxyx()
-        if height < 18 or width < 68:
-            self.put(0, '请将终端扩大至至少 68 列 × 18 行；q 退出')
+        height,width=self.screen.getmaxyx()
+        if width<68 or height<18:
+            self.put(0,'窗口太小：请扩大到至少 68 列 × 18 行')
+            self.put(2,'c 取消任务；q 返回 / 退出；扩大窗口后会恢复当前页面')
             self.screen.refresh()
             return
-        self.put(0, f'KESTREL DROP  /  电脑下载管理  {__version__}', curses.A_BOLD)
-        self.put(1, f'档案目录：{self.library.root}', curses.A_DIM)
-        self.put(2, 'D1/D2/D3 身份识别与历史采集 · 连接前断开手机 LiNK', curses.A_DIM)
-        self.put(4, '选 型号  设备序列号          附近    已入库    未确认   状态 / 最新时间', curses.A_BOLD)
-        visible = max(2, min(8, height - 15))
-        values = list(self.devices.values())
-        top = max(0, self.selected - visible + 1)
-        for index, item in enumerate(values[top:top + visible], top):
-            serial = item.get('serial') or '待核验（x）'
-            kind = item.get('device_type') or model_type(item.get('model')) or '未知'
-            state = (item.get('error') or ('身份冲突，请核验' if item.get('identity_conflict') else None)
-                     or item.get('last_timestamp') or item.get('identity_error')
-                     or ('广播编号；x 核验' + ('，历史待适配' if item.get('history_supported') is False else '') if item.get('serial') and not item.get('identity_verified') else
-                         '历史待适配' if item.get('history_supported') is False else '待下载' if item.get('serial') else '按 x 读取编号'))
-            progress=self.device_progress.get(item.get('serial'),{})
-            if self.job and progress.get('event')=='progress':
-                state=f'接收 {progress.get("received",0)}/{progress.get("expected",0)}'
-            elif self.job and progress.get('event')=='phase': state=PHASES.get(progress.get('phase'),state)
-            elif self.job and progress.get('event')=='completed': state=STATUSES.get(progress.get('status'),state)
-            elif self.job and progress.get('event')=='error': state='未完成：'+progress.get('message','查看日志')
-            pending = item.get('pending_records')
-            line = (f'{"*" if item.get("serial") in self.marked else " "}  {kind:<4} {serial:<18} '
-                    f'{"附近" if item.get("nearby") else "—":<4} '
-                    f'{item.get("database_records", item.get("committed_records", "—")):>7}  '
-                    f'{pending if pending is not None else "—":>7}  {state}')
-            self.put(5 + index - top, line, curses.A_REVERSE if index == self.selected else 0)
-        if not values:
-            self.put(5, '暂无设备。按 s 扫描附近设备，或按 i 导入已有 CSV。')
-        row = 6 + visible
-        self.put(row, self.message, curses.A_BOLD)
-        self.put(row + 1, self.progress or ('执行中 ' + '|/-\\'[int(time.monotonic() * 4) % 4] if self.job else '等待操作'))
-        log_start = row + 3
-        for number, line in enumerate(list(self.logs)[-max(1, height - log_start - 3):]):
-            self.put(log_start + number, line, curses.A_DIM)
-        self.put(height - 2, '↑↓ 选择  空格勾选  a 批量  Enter/d 下载  s 扫描  x 读编号  v 记录  e 导出')
-        self.put(height - 1, f'g 设备配置  j 并发({self.parallel})  b 备份  m 迁移  p 位置  c 取消  ? 帮助  q 退出', curses.A_DIM)
-        if self.preview is not None:
-            self.screen.erase()
-            self.put(0, '最近 100 条记录 · ↑↓ 滚动 · Esc/q 返回 · 时间为设备本地时间', curses.A_BOLD)
-            self.put(2, '时间                    温度°C     湿度%     气压hPa')
-            for index, item in enumerate(self.preview[self.preview_offset:self.preview_offset + height - 5]):
-                humidity = item['relative_humidity_pct']
-                pressure = item['station_pressure_hpa']
-                self.put(index + 3, f'{item["timestamp_device_local"]}   {item["temperature_c"]:>8}  '
-                         f'{str(humidity) if humidity is not None else "--":>8}  '
-                         f'{str(pressure) if pressure is not None else "--":>10}')
-        if self.text_view is not None:
-            self.screen.erase()
-            self.put(0, '帮助 / 任务日志 · ↑↓ / PgUp / PgDn 滚动 · Esc/q 返回', curses.A_BOLD)
-            for index, line in enumerate(self.text_view[self.text_offset:self.text_offset + height - 3]):
-                self.put(index + 2, line)
-        if self.device_state is not None:
-            self.screen.erase()
-            state=self.device_state;settings=state.get('settings') or {}
-            self.put(0,f'设备 {state.get("serial")} · {state.get("model", "")} · 配置 / 实时测量',curses.A_BOLD)
-            wrap_label='设备未提供' if settings.get('wrap') is None else '开启' if settings.get('wrap') else '关闭'
-            battery='未读到' if state.get('battery_pct') is None else str(state['battery_pct'])+'%（设备报告）'
-            lines=[f'名称：{state.get("name") or "默认名称"}   电量：{battery}',
-                f'固件：{state.get("firmware")}   硬件：{state.get("hardware")}',
-                f'设备当前时间：{state.get("device_time")}（不会自动校时）',
-                f'1 采样间隔：{settings.get("interval_seconds")} 秒',
-                f'2 滚动覆盖：{wrap_label}（关闭时满后停止记录）',
-                '3 校准设备时间（保留原始历史时间）',
-                '4 修改设备名称',f'5 实时更新间隔：{settings.get("update_seconds")} 秒',
-                f'6 气压参考海拔：{settings.get("reference_altitude_m")} 米',
-                'r 重新读取   w 读取实时测量   b 闪灯定位',
-                self.message]
-            if state.get('live'):
-                readings=state['live']['measurements']
-                entries=[(key,label,unit) for key,label,unit in [('temperature_c','温度','°C'),('relative_humidity_pct','湿度','%'),('heat_index_c','热指数','°C'),('dew_point_c','露点','°C'),('station_pressure_hpa','气压','hPa'),('density_altitude_m','密度高度','m')]]
-                for offset in range(0,len(entries),2):
-                    parts=[]
-                    for key,label,unit in entries[offset:offset+2]:
-                        value=readings.get(key);parts.append(f'{label}：{value if value is not None else "--"} {unit}')
-                    lines.append('    '.join(parts))
-            if state.get('read_errors'):lines.append('部分字段未读到：'+str(state['read_errors']))
-            for row,line in enumerate(lines,2): self.put(row,line)
-            self.put(height-1,'Enter / Esc 返回设备列表；配置写入后逐项回读，失败不自动重试',curses.A_DIM)
-        if self.form:
-            self.screen.erase()
-            self.put(1, self.form['title'], curses.A_BOLD)
-            for index, (label, value) in enumerate(self.form['fields']):
-                self.put(4 + index * 3, label)
-                if len(clip(value, width - 6)) < len(value):
-                    value = '…' + clip(value[::-1], width - 7)[::-1]
-                self.put(5 + index * 3, '> ' + value, curses.A_REVERSE if index == self.form['index'] else 0)
-            self.put(height - 4, self.form['error'])
-            self.put(height - 2, 'Tab / ↑↓ 切换字段 · Enter 下一项 / 提交 · Ctrl+U 清空 · Esc 返回')
-        if self.result_view is not None and self.text_view is None:
-            self.draw_result(height, width)
+        self.draw_dashboard(height,width)
+        # Overlay order is also the keyboard priority: the topmost page owns input.
+        if self.device_state is not None: self.draw_device(height,width)
+        if self.preview is not None: self.draw_preview(height,width)
+        if self.result_view is not None: self.draw_result(height,width)
+        if self.text_view is not None: self.draw_text(height,width)
+        if self.form is not None: self.draw_form(height,width)
+        if self.review is not None: self.draw_review(height,width)
+        try: curses.curs_set(1 if self.form is not None and self.review is None else 0)
+        except curses.error: pass
         self.screen.refresh()
 
-    def draw_result(self, height, width):
+    def draw_dashboard(self,height,width):
+        self.put(0,f'KESTREL DROP  /  电脑下载管理  {__version__}',curses.A_BOLD)
+        self.put(1,f'数据目录：{self.library.root}',curses.A_DIM)
+        nearby=sum(bool(item.get('nearby')) for item in self.devices.values())
+        scope=f'勾选的 {len(self.marked)} 台' if self.marked else '本次附近设备'
+        self.put(2,f'附近 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.parallel} · a 采集{scope}')
+        values=list(self.devices.values())
+        if values:
+            item=values[min(self.selected,len(values)-1)]
+            self.put(3,f'当前 {self.selected+1}/{len(values)}：{item.get("serial") or "编号待核验"} · '+('已核验' if item.get('identity_verified') else '连接后核验编号'),curses.A_DIM)
+        self.put(4,'选 型号  设备编号          附近    已入库    未确认   状态 / 末条记录时间',curses.A_BOLD)
+        visible=max(2,min(8,height-15))
+        top=max(0,self.selected-visible+1)
+        for index,item in enumerate(values[top:top+visible],top):
+            serial=item.get('serial') or '待核验（x）'
+            kind=item.get('device_type') or model_type(item.get('model')) or '未知'
+            state=(item.get('error') or ('身份冲突，请核验' if item.get('identity_conflict') else None)
+                   or item.get('identity_error') or item.get('last_timestamp') or
+                   ('待下载' if item.get('serial') else '按 x 读取编号'))
+            if item.get('history_supported') is False: state='历史格式待适配'
+            progress=self.device_progress.get(item.get('serial'),{})
+            if self.job:
+                if progress.get('event')=='progress': state=f'接收 {progress.get("received",0)}/{progress.get("expected",0)}'
+                elif progress.get('event')=='phase': state=PHASES.get(progress.get('phase'),state)
+                elif progress.get('event')=='completed': state=STATUSES.get(progress.get('status'),state)
+                elif progress.get('event')=='error': state='未完成：'+progress.get('message','查看日志')
+            location='附近' if item.get('nearby') else '—'
+            location+= ' '*max(0,4-text_width(location))
+            pending=item.get('pending_records')
+            line=(f'{"*" if item.get("serial") in self.marked else " "}  {kind:<4} {serial:<18} {location} '
+                  f'{item.get("database_records",item.get("committed_records","—")):>7}  '
+                  f'{pending if pending is not None else "—":>7}  {state}')
+            self.put(5+index-top,line,curses.A_REVERSE if index==self.selected else 0)
+        if not values:
+            self.put(6,'第一次使用：按 s 扫描附近设备',curses.A_BOLD)
+            self.put(7,'选设备按 Enter 下载；编号未知时先按 x 核验')
+            self.put(8,'已下载的数据可离线按 v 查看、e 导出；? 查看帮助',curses.A_DIM)
+        row=6+visible
+        for offset,line in enumerate(wrap_lines(self.message,width-3)[:2]): self.put(row+offset,line,curses.A_BOLD)
+        self.put(row+2,self.progress or ('执行中 '+ '|/-\\'[int(time.monotonic()*4)%4] if self.job else '等待操作'))
+        log_start=row+4
+        for offset,line in enumerate(list(self.logs)[-max(1,height-log_start-3):]):self.put(log_start+offset,line,curses.A_DIM)
+        self.put(height-2,'Enter 下载  s 扫描  空格勾选 / a 批量  g 配置  v 查看  e 导出')
+        self.put(height-1,'Ctrl+A 全选附近  u 清选择  j 并发  b 备份  l 日志  ? 帮助  q 退出',curses.A_DIM)
+
+    def draw_preview(self,height,width):
         self.screen.erase()
-        view = self.result_view
-        self.put(1, '下载结果' if view['action'] == 'download' else '操作结果', curses.A_BOLD)
-        if view['outcomes']:
-            incomplete = sum(item['status'] in ('pending', 'failed') for item in view['outcomes'])
-            self.put(2, f'本次处理 {len(view["outcomes"])} 台设备 · 未完成 {incomplete} 台（完整明细见日志）')
-        row = 3
-        for item in view['outcomes'][:max(1, height - 12)]:
-            self.put(row, f'{item["serial"]} · {STATUSES.get(item["status"], item["status"])}', curses.A_BOLD)
-            row += 1
-            if item.get('status') != 'failed':
-                self.put(row, f'本次新增 {item.get("added_records", 0):,} 条 · 累计 {item.get("total_records", 0):,} 条 · 未确认 {item.get("pending_records", 0):,} 条')
-                row += 1
-                if len(view['outcomes']) == 1:
-                    self.put(row, f'首末记录时间：{item.get("first_timestamp") or "—"} / {item.get("last_timestamp") or "—"}')
-                    row += 2
-            if row >= height - 10:
-                break
-        if view['failures']:
-            failure = view['failures'][0]
-            self.put(row, failure.get('title') or TITLES.get(failure['code'], '操作未完成'), curses.A_BOLD)
-            row += 1
-            for text in (failure['action'],):
-                while text and row < height - 4:
-                    segment = clip(text, width - 3)
-                    self.put(row, segment)
-                    text = text[len(segment):]
-                    row += 1
-        elif not view['code']:
-            statuses = {item['status'] for item in view['outcomes']}
-            self.put(row, '设备暂无记录，尚未建立档案。' if statuses == {'empty'} else
-                     '本次仅预演，未访问蓝牙或建立档案。' if statuses == {'dry_run'} else
-                     '完整记录已验证保存。可以预览、导出或备份。')
-        self.put(height - 3, ('r 重试本次操作 · ' if any(item.get('retryable') for item in view['failures']) else '')
-                 + 'l 查看详情日志 · Enter 返回')
-        self.put(height - 2, 'v 查看已保存记录 · e 导出 CSV · b 数据库备份', curses.A_DIM)
+        self.put(0,'最近 100 条 · 按设备序号排列，最新在上 · Esc 返回',curses.A_BOLD)
+        self.put(1,f'显示 {min(len(self.preview),self.preview_offset+1)}/{len(self.preview)} · ↑↓ / PgUp / PgDn / Home / End',curses.A_DIM)
+        self.put(2,'设备记录时间            温度°C     湿度%     气压hPa')
+        for row,item in enumerate(self.preview[self.preview_offset:self.preview_offset+height-5],3):
+            humidity=item['relative_humidity_pct'];pressure=item['station_pressure_hpa']
+            self.put(row,f'{item["timestamp_device_local"]}   {item["temperature_c"]:>8}  '
+                     f'{str(humidity) if humidity is not None else "--":>8}  '
+                     f'{str(pressure) if pressure is not None else "--":>10}')
+        if not self.preview:self.put(4,'没有可显示的正式记录')
+        self.put(height-1,'-- 表示该型号没有此测量；时间为设备原始本地时间',curses.A_DIM)
+
+    def draw_text(self,height,width):
+        self.screen.erase()
+        self.put(0,'帮助 / 任务日志 · ↑↓ / PgUp / PgDn · Esc 返回上一层',curses.A_BOLD)
+        lines=self.wrapped_text()
+        self.text_offset=min(self.text_offset,max(0,len(lines)-(height-4)))
+        for row,line in enumerate(lines[self.text_offset:self.text_offset+height-4],2):self.put(row,line)
+        self.put(height-1,f'第 {min(len(lines),self.text_offset+1)}/{len(lines)} 行 · Home / End 到首尾',curses.A_DIM)
+
+    def draw_device(self,height,width):
+        self.screen.erase()
+        state=self.device_state;settings=state.get('settings') or {}
+        self.put(0,f'设备 {state.get("serial")} · {state.get("model","")} · 配置 / 实时测量',curses.A_BOLD)
+        wrap='未读到' if settings.get('wrap') is None else '开启' if settings.get('wrap') else '关闭'
+        battery='未读到' if state.get('battery_pct') is None else str(state['battery_pct'])+'%（设备报告）'
+        lines=[f'名称：{state.get("name") or "默认名称"}   电量：{battery}',
+               f'固件：{state.get("firmware") or "未读到"}   硬件：{state.get("hardware") or "未读到"}',
+               f'设备当前时间：{state.get("device_time") or "未读到"}（不自动校时）',
+               f'1 采样间隔：{format_interval(settings.get("interval_seconds"))}',
+               f'2 滚动覆盖：{wrap}（关闭时满后停止记录）',
+               '3 校准设备时间（不改旧记录）   4 修改设备名称',
+               f'5 实时更新间隔：{format_interval(settings.get("update_seconds"))}']
+        if (state.get('device_type') or model_type(state.get('model')))=='D3':lines.append(f'6 气压参考海拔：{settings.get("reference_altitude_m")} 米')
+        lines+=['r 重新读取   w 读实时测量   f 闪灯定位   b 数据库备份',
+                '显示的是上次读取值，修改结果未确认：请先 r 回读' if state.get('read_stale') else self.message]
+        if state.get('live'):
+            readings=state['live']['measurements']
+            fields=[('temperature_c','温度','°C'),('relative_humidity_pct','湿度','%'),('heat_index_c','热指数','°C'),
+                    ('dew_point_c','露点','°C'),('station_pressure_hpa','气压','hPa'),('density_altitude_m','密度高度','m')]
+            for offset in range(0,len(fields),2):
+                lines.append('    '.join(f'{label}：{readings.get(key) if readings.get(key) is not None else "--"} {unit}' for key,label,unit in fields[offset:offset+2]))
+        if state.get('read_errors'):lines.append('部分信息未读到，按 r 重试；l 查看日志')
+        for row,line in enumerate(lines[:height-4],2):self.put(row,line)
+        self.put(height-1,'修改：输入新值 → 预览 → 写入 / 回读 · l 日志 · ? 帮助 · Esc 返回',curses.A_DIM)
+
+    def draw_form(self,height,width):
+        self.screen.erase()
+        form=self.form
+        for row,line in enumerate(wrap_lines(form['title'],width-3)[:2]):self.put(row,line,curses.A_BOLD)
+        if form.get('target'):self.put(2,f'设备编号：{form["target"]}',curses.A_DIM)
+        count=max(1,(height-8)//3);top=max(0,form['index']-count+1)
+        cursor_screen=None
+        for index,(label,value) in enumerate(form['fields'][top:top+count],top):
+            row=4+(index-top)*3
+            self.put(row,label)
+            positions=form.get('cursors',[len(item[1]) for item in form['fields']])
+            visible,column=input_window(value,positions[index],width-6)
+            self.put(row+1,'> '+visible,curses.A_REVERSE if index==form['index'] else 0)
+            if index==form['index']:cursor_screen=(row+1,min(width-2,3+column))
+        help_text={
+            'set_interval':'单位为秒：300=5分钟，600=10分钟。支持 2/5/10/20/30/60/120/300/360/600/1200/1800/3600/7200/21600/43200。',
+            'set_wrap':'输入 on/开启 或 off/关闭；关闭后日志满时停止记录。',
+            'set_time':'输入 now 使用电脑本地时间，或 YYYY-MM-DD HH:MM:SS；旧记录保留。',
+            'set_name':'仅支持1–20个可打印ASCII字符，如 Lab-01；真实设备编号不会改变。',
+            'set_update':'范围2–60秒，影响实时刷新，与历史采样间隔分开。',
+            'set_altitude':'单位为米，可为负值；只用于气压计算，不改出厂校准。',
+            'export':'不筛选时间可直接按 Enter 跳过；结束日期包含当天整天。'}
+        start=4+min(count,len(form['fields']))*3
+        for row,line in enumerate(wrap_lines(help_text.get(form['action'],''),width-3),start):
+            if row>=height-5:break
+            self.put(row,line,curses.A_DIM)
+        for row,line in enumerate(wrap_lines(form['error'],width-3)[:2],height-5):self.put(row,line,curses.A_BOLD)
+        self.put(height-2,'Enter 下一项 / 检查 / 提交 · Esc 取消 · Ctrl+U 清空')
+        self.put(height-1,'←→ / Home / End 移动光标 · Backspace / Delete 编辑',curses.A_DIM)
+        if cursor_screen and hasattr(self.screen,'move'):
+            try:self.screen.move(*cursor_screen)
+            except curses.error:pass
+
+    def draw_review(self,height,width):
+        self.screen.erase()
+        review=self.review
+        self.put(0,'检查设备变更',curses.A_BOLD)
+        lines=[f'设备编号：{review["serial"]}',f'修改项目：{review["label"]}',
+               f'上次读取：{review["old"]}',f'准备写入：{review["new"]}','',review['impact'],
+               '写入前会重新核验设备，并以设备最新设置为基础只修改此项。']
+        if '--time' in review['arguments'] and 'now' in review['arguments']:
+            lines.append('预览时电脑本地时间：'+datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'))
+        wrapped=[line for text in lines for line in wrap_lines(text,width-3)]
+        for row,line in enumerate(wrapped[:height-5],2):self.put(row,line)
+        if review.get('error'):self.put(height-4,review['error'],curses.A_BOLD)
+        self.put(height-2,'Enter 写入并回读验证 · Esc 返回修改',curses.A_BOLD)
+        self.put(height-1,self.message if self.job else '仅此步骤会发送配置；关闭预览不会改变设备',curses.A_DIM)
+
+    def draw_result(self,height,width):
+        self.screen.erase()
+        view=self.result_view;outcomes=view['outcomes']
+        selected=min(view.get('selected',0),max(0,len(outcomes)-1))
+        incomplete=sum(item.get('status') in ('pending','failed') for item in outcomes)
+        self.put(0,'下载结果' if view['action']=='download' else '操作结果',curses.A_BOLD)
+        self.put(1,f'本次处理 {len(outcomes)} 台 · 未完成 {incomplete} 台 · 退出码 {view["code"]}')
+        self.put(2,f'第 {min(len(outcomes),selected+1)}/{len(outcomes)} 项 · ↑↓ / PgUp / PgDn / Home / End 显示全部结果',curses.A_DIM)
+        count=max(1,height-13);top=max(0,selected-count+1)
+        self.put(3,'设备编号          状态              新增     累计   未确认',curses.A_BOLD)
+        for index,item in enumerate(outcomes[top:top+count],top):
+            label=STATUSES.get(item.get('status'),item.get('status','未完成'))
+            label=clip(label,16)+' '*max(0,16-text_width(clip(label,16)))
+            self.put(4+index-top,f'{item["serial"]:<16} {label} {item.get("added_records",0):>6} {item.get("total_records",0):>8} {item.get("pending_records",0):>6}',curses.A_REVERSE if index==selected else 0)
+        item=outcomes[selected] if outcomes else None
+        failure=(item.get('error') if item else None) or next((f for f in view['failures'] if item and f.get('serial')==item['serial']),None)
+        if failure is None:failure=next((f for f in view['failures'] if not f.get('serial')),None)
+        lines=[]
+        if item and item.get('status')!='failed':
+            lines.append(f'本次新增 {item.get("added_records",0):,} 条 · 累计 {item.get("total_records",0):,} 条 · 未确认 {item.get("pending_records",0):,} 条')
+        if failure:
+            lines.append(failure.get('title') or TITLES.get(failure.get('code'),'操作未完成'))
+            lines.extend(wrap_lines('原因：'+failure.get('message','查看日志'),width-3)[:1])
+            lines.extend(wrap_lines('建议：'+failure.get('action','按 l 查看日志'),width-3)[:2])
+        elif item and item.get('status')=='pending':lines.append('仍有数据未完成确认；请保留档案，等待新样本后重试。')
+        elif item and item.get('status')=='empty':lines.append('设备暂无记录；未伪造观测。')
+        elif item and item.get('status')=='dry_run':lines.append('仅预演，未访问蓝牙或建立档案。')
+        elif item:
+            lines.append('记录已正式保存，可查看、导出或备份。')
+            if item.get('last_timestamp'):lines.append('末条设备记录时间：'+item['last_timestamp'])
+        for row,line in enumerate(lines[:5],height-8):self.put(row,line)
+        retry=any(f.get('retryable') for f in view['failures'])
+        self.put(height-2,('r 仅重试未完成项 · ' if retry else '')+'l 日志 · Esc / Enter 返回')
+        self.put(height-1,'v 查看当前设备记录 · e 导出 · b 数据库备份',curses.A_DIM)
 
     def loop(self):
         self.screen.timeout(100)

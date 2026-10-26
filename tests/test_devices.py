@@ -358,7 +358,7 @@ class MultiDeviceUI(unittest.TestCase):
         self.assertIn('型号',text)
         for kind in ('D1','D2','D3'): self.assertIn(kind,text)
         self.assertIn('待核验',text)
-        self.assertIn('历史采集',text)
+        self.assertIn('a 采集',text)
 
     def test_d1_preview_renders_absent_measurements(self):
         terminal=self.terminal({})

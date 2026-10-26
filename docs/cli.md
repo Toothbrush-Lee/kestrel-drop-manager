@@ -1,0 +1,130 @@
+# 命令参考
+
+适用于 0.9.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
+
+## 基本约定
+
+```bash
+uv run kestrel.py                         # 打开 TUI，与 tui 子命令相同
+uv run kestrel.py --version
+uv run kestrel.py --data-dir ~/KestrelData list
+```
+
+全局 `--data-dir`、`--events-json` 必须放在子命令之前。数据目录优先级：命令参数 → `KESTREL_DATA_DIR` → 保存的位置 → 默认位置。`configure` 只保存以后使用的位置，不移动数据。
+
+设备历史读取、配置写入、闪灯均需要显式 `--execute`；缺少它时只预演。`device`、`live` 和身份读取本身会连接蓝牙，无须此开关。批量下载不要通过多个进程同时操作同一目录。
+
+## 发现与身份
+
+```bash
+uv run kestrel.py scan --timeout 20
+uv run kestrel.py scan --timeout 20 --identify
+uv run kestrel.py scan --timeout 20 --register
+uv run kestrel.py identify --ble-id '扫描得到的地址'
+uv run kestrel.py register --ble-id '扫描得到的地址'
+uv run kestrel.py identify --serial 2509793 --timeout 30
+```
+
+普通 scan 只看广播，不连接、不登记；`--identify` 逐台只读核验；`--register` 核验后额外保存本地登记。identify/register 必须在 `--serial` 和 `--ble-id` 中选一个。D1/D2 广播可能没有编号，用扫描地址读取标准 GATT 身份；地址只是临时连接位置，不能当作永久设备编号。
+
+## 下载与批量地址
+
+```bash
+# 默认只预演：不访问蓝牙，不创建数据目录
+uv run kestrel.py download --serial 2509793
+uv run kestrel.py download --serial 2509793 --execute
+uv run kestrel.py download --serial 2509793 --ble-id '扫描得到的地址' --execute
+uv run kestrel.py download --serials 2509793 2525425 --parallel 2 --execute
+uv run kestrel.py download --all --execute
+```
+
+`--serial`、`--serials`、`--all` 三选一。`--all` 包括全部本地登记设备、空档案和首次中断项，可能包含离线设备；它不同于 TUI 无勾选时只采集附近设备的策略。
+
+批量指定地址时，`--ble-ids` 与 `--serials` 必须逐项对应，`-` 表示按编号寻找。整条命令在同一行输入，不能把 UUID 在中间断开。下面有三台设备、三个定位项：
+
+```bash
+uv run kestrel.py download --serials 2509793 2525425 3087666 --ble-ids '第一台扫描地址' - '第三台扫描地址' --parallel 2 --execute
+```
+
+| 参数 | 默认 / 行为 |
+| --- | --- |
+| --timeout | 20 秒，设备查找/连接相关超时 |
+| --maxrows | 20000，单次接收记录上限；不是累计库容量 |
+| --parallel | 1，可选 1–8；建议先尝试 2 |
+| --execute | 真正发送历史读取命令 |
+
+批量共享初始扫描，一台失败后其他设备继续。并发时未在初始扫描中出现的设备不会另起扫描干扰传输，重新扫描后重试。首次完整读取可能需要十多分钟；增量按保存的游标继续。达到接收进度 100% 后仍需等最终校验。
+
+## 本地查询、导出与检查
+
+```bash
+uv run kestrel.py list
+uv run kestrel.py status
+uv run kestrel.py status 2509793
+uv run kestrel.py overview
+uv run kestrel.py records 2509793 --limit 100
+uv run kestrel.py export 2509793 ~/Desktop/drop-oct22.csv --since 2026-10-22 --until 2026-10-22
+uv run kestrel.py db
+```
+
+list/status 返回档案状态；overview 把设备登记、正式条数、下载边界和最近下载时间关联起来。SQLite `devices` 是身份表，观测条数来自观测及同步相关表，不应通过手动修改身份表更新条数。
+
+records/export 只读正式记录，不包含待确认块。导出起止时间均包含边界，结束只写日期包含当天整天；设备时间没有时区。CSV 不覆盖已有文件。db 完整检查数据库、原始记录和恢复边界，数据量大时比日常状态查询耗时。
+
+## 设备配置与实时测量
+
+```bash
+uv run kestrel.py device 2509793
+uv run kestrel.py set 2509793 --interval 600 --wrap on
+uv run kestrel.py set 2509793 --interval 600 --wrap on --execute
+uv run kestrel.py set 2509793 --time now --execute
+uv run kestrel.py set 2509793 --name 'DROP-001' --execute
+uv run kestrel.py live 2509793 --samples 5 --period 2
+uv run kestrel.py blink 2509793 --execute
+uv run kestrel.py actions 2509793 --limit 20
+```
+
+这些设备命令支持 `--ble-id` 和 `--timeout`。set 可组合多项；TUI 为单项修改，CLI 组合写入仍逐项核验，不能把整个硬件写入视为可回滚事务。
+
+| set 参数 | 值 |
+| --- | --- |
+| --interval | 秒数：2, 5, 10, 20, 30, 60, 120, 300, 360, 600, 1200, 1800, 3600, 7200, 21600, 43200 |
+| --wrap | on 覆盖最早设备记录，off 满后停止记录 |
+| --update-seconds | 2–60 秒，实时测量更新间隔 |
+| --reference-altitude | D3 气压计算参考海拔，整数米，有效范围 -32766 至 32767 |
+| --name | 1–20 个可打印 ASCII 字符 |
+| --time | now 或不带时区的本地时间，例如 `"2026-10-27 09:00:00"` |
+
+校时不改变旧历史；now 按执行时电脑本地时间取值。写入取消、断线或失败后，先 device 回读再决定是否重试。actions 保存配置审计；started 不是成功证据。live 的测量不会入历史库，period 是电脑读取间隔，不能保证设备每次产生新值。
+
+## 数据位置、备份、恢复和旧版导入
+
+```bash
+uv run kestrel.py backup
+uv run kestrel.py backup ~/Desktop/kestrel-backup.sqlite
+uv run kestrel.py --data-dir ~/KestrelData restore ~/Desktop/kestrel-backup.sqlite
+uv run kestrel.py --data-dir ~/KestrelData db
+uv run kestrel.py configure ~/KestrelData
+uv run kestrel.py migrate
+uv run kestrel.py import '/实际路径/history.csv' --metadata '/实际路径/history.csv.json'
+```
+
+backup 默认写到数据目录/backups，目标文件不能已存在。restore 目标必须为空数据目录，验证后才发布；configure 不搬数据。备份包含数据库内的正式观测、暂存、身份和配置审计，不含 CSV、位置设置或 legacy 原件。
+
+migrate 用于旧 CSV/早期 SQLite，先保存和校验再切换；0.8→0.9 无需迁移。import 只支持本工具旧 D3 完整原始 CSV 及元数据，不是任意 CSV/LiNK 导出的通用导入；同编号已有档案时拒绝覆盖。详细恢复与升级见[用户手册](user-guide.md)。
+
+## 自动化、日志和退出码
+
+```bash
+uv run kestrel.py --events-json download --serials 2509793 2525425 --parallel 2 --execute > /tmp/kestrel-events.jsonl
+```
+
+JSON Lines 每行一个事件，带 `version: 1`，包括 phase/progress/log/error/completed/result/sample/finished。需要同时检查每台 completed/error、最终结果和进程退出码。finished 表示命令已结束，不等于全部成功。不要混入普通标准输出或用每一行都当作最终结果。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 成功，或预演完成 |
+| 2 | 参数错误、失败或未全部完成；批量中一台未完成也返回 2 |
+| 130 | 用户取消 |
+
+Ctrl+C 取消时会清理连接并保留持久化边界；不能把强制杀进程当作正常取消方式。记录诊断文件放临时目录或本地 `data/analysis/主题-日期/`，避免散落根目录；输出可能包含设备身份和观测，不进入代码仓库。
