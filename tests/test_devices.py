@@ -30,7 +30,12 @@ class Fleet:
         async def discover(**kwargs):
             owner.scans += 1
             return {address: (Item(address=address,name=s.get('name','')), Item(local_name=s.get('name',''),rssi=s.get('rssi',-50),service_uuids=s.get('services',[]))) for address,s in specs.items()}
-        self.module.BleakScanner=Item(discover=discover)
+        async def find_device_by_filter(predicate, **kwargs):
+            found = await discover(**kwargs)
+            for device, adv in found.values():
+                if predicate(device, adv): return device
+            return None
+        self.module.BleakScanner=Item(discover=discover, find_device_by_filter=find_device_by_filter)
         class Client:
             def __init__(self, device, **kwargs): self.address=device.address
             async def __aenter__(self):

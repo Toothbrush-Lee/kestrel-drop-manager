@@ -1,6 +1,6 @@
 # 命令参考
 
-适用于 0.9.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
+适用于 0.9.1。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
 
 ## 基本约定
 
@@ -17,7 +17,8 @@ uv run kestrel.py --data-dir ~/KestrelData list
 ## 发现与身份
 
 ```bash
-uv run kestrel.py scan --timeout 20
+uv run kestrel.py scan                   # 默认 5 秒快扫
+uv run kestrel.py scan --timeout 20      # 较多设备或漏扫时延长
 uv run kestrel.py scan --timeout 20 --identify
 uv run kestrel.py scan --timeout 20 --register
 uv run kestrel.py identify --ble-id '扫描得到的地址'
@@ -25,7 +26,7 @@ uv run kestrel.py register --ble-id '扫描得到的地址'
 uv run kestrel.py identify --serial 2509793 --timeout 30
 ```
 
-普通 scan 只看广播，不连接、不登记；`--identify` 逐台只读核验；`--register` 核验后额外保存本地登记。identify/register 必须在 `--serial` 和 `--ble-id` 中选一个。D1/D2 广播可能没有编号，用扫描地址读取标准 GATT 身份；地址只是临时连接位置，不能当作永久设备编号。
+普通 scan 默认收集 5 秒广播，不连接、不登记；快扫不保证发现全部设备，可重复扫描或显式延长。`--identify` 逐台只读核验；`--register` 核验后额外保存本地登记。identify/register 必须在 `--serial` 和 `--ble-id` 中选一个。D1/D2 广播可能没有编号，用扫描地址读取标准 GATT 身份；地址只是临时连接位置，不能当作永久设备编号。已知地址的配置、身份读取和单台下载定位会在目标广播出现时立即结束；只有编号时仍完整扫描检查重复身份。地址失效时使用同一轮已看到的广播按唯一编号回退，不额外扫描。`--timeout` 是定位等待上限，目标提前出现就提前结束；它不是整个配置操作的总耗时。
 
 ## 下载与批量地址
 

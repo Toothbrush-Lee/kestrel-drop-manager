@@ -68,14 +68,14 @@ async def ble_call(operation, *args, **kwargs):
         raise BluetoothFailure(f'蓝牙操作失败：{exc}。请断开手机 LiNK，检查蓝牙开关和终端权限，然后重试。') from exc
 
 
-async def scan_snapshot(timeout=15):
+async def scan_snapshot(timeout=5):
     if timeout <= 0: raise ValueError('扫描时间必须大于 0')
     from bleak import BleakScanner
     events.emit('phase', phase='scanning')
     return await ble_call(BleakScanner.discover, timeout=timeout, return_adv=True)
 
 
-async def scan(timeout=15):
+async def scan(timeout=5):
     return candidates(await scan_snapshot(timeout))
 
 
@@ -91,6 +91,25 @@ def candidates(found):
     return sorted(result, key=lambda r: r['rssi'] if r['rssi'] is not None else -999, reverse=True)
 
 
+async def locate_snapshot(address, timeout):
+    """Stop at the requested address; retain observations for stale-address fallback.
+
+    BLEDevice includes native backend state and cannot be reconstructed from a
+    JSON scan result in another worker. Reacquire it without a full timed scan.
+    """
+    from bleak import BleakScanner
+    observed = {}
+    target = address.casefold()
+
+    def match(device, adv):
+        observed[device.address.casefold()] = (device, adv)
+        return device.address.casefold() == target
+
+    events.emit('phase', phase='locating')
+    await ble_call(BleakScanner.find_device_by_filter, match, timeout=timeout)
+    return observed
+
+
 async def resolve(args):
     """Resolve a fresh BLEDevice by address or unambiguous advertised serial."""
     timeout = args.scan_timeout
@@ -99,9 +118,13 @@ async def resolve(args):
     if expected is not None: expected = serial_number(expected)
     target = (getattr(args, 'ble_id', None) or '').strip().casefold()
     if not expected and not target: raise ValueError('请提供序列号或 BLE 地址')
-    events.emit('phase', serial=expected, phase='scanning')
     snapshot = getattr(args, 'discovery', None)
-    found = snapshot if snapshot is not None else await scan_snapshot(timeout)
+    if snapshot is not None:
+        found = snapshot
+    elif target:
+        found = await locate_snapshot(target, timeout)
+    else:
+        found = await scan_snapshot(timeout)
     exact, by_serial = [], []
     for device, adv in found.values():
         if target and device.address.casefold() == target:

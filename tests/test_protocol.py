@@ -111,6 +111,11 @@ class TestConnectionResolution(unittest.IsolatedAsyncioTestCase):
             async def discover(**kwargs):
                 self.assertEqual(kwargs['return_adv'], True)
                 return {'test': (known, adv)}
+        async def find_device_by_filter(predicate, **kwargs):
+            for device, advertisement in (await Scanner.discover(return_adv=True, **kwargs)).values():
+                if predicate(device, advertisement): return device
+            return None
+        Scanner.find_device_by_filter = staticmethod(find_device_by_filter)
         fake.BleakScanner = Scanner
         args = SimpleNamespace(ble_id=known.address, serial='2866855',scan_timeout=10)
         with patch.dict(sys.modules, {'bleak': fake, 'bleak.exc': SimpleNamespace(BleakError=type('BleakError', (Exception,), {}))}):
@@ -128,6 +133,11 @@ class TestConnectionResolution(unittest.IsolatedAsyncioTestCase):
             @staticmethod
             async def discover(**kwargs):
                 return {'test': (current, adv)}
+        async def find_device_by_filter(predicate, **kwargs):
+            for device, advertisement in (await Scanner.discover(return_adv=True, **kwargs)).values():
+                if predicate(device, advertisement): return device
+            return None
+        Scanner.find_device_by_filter = staticmethod(find_device_by_filter)
         fake.BleakScanner = Scanner
         args = SimpleNamespace(ble_id='OLD-UUID',serial='2866855',scan_timeout=10)
         with patch.dict(sys.modules, {'bleak': fake, 'bleak.exc': SimpleNamespace(BleakError=type('BleakError', (Exception,), {}))}):
@@ -143,6 +153,11 @@ class TestConnectionResolution(unittest.IsolatedAsyncioTestCase):
             @staticmethod
             async def discover(**kwargs):
                 return {}
+        async def find_device_by_filter(predicate, **kwargs):
+            for device, advertisement in (await Scanner.discover(return_adv=True, **kwargs)).values():
+                if predicate(device, advertisement): return device
+            return None
+        Scanner.find_device_by_filter = staticmethod(find_device_by_filter)
         fake.BleakScanner = Scanner
         args = SimpleNamespace(ble_id='OLD-UUID',serial='2866855',scan_timeout=1)
         with patch.dict(sys.modules, {'bleak': fake, 'bleak.exc': SimpleNamespace(BleakError=type('BleakError', (Exception,), {}))}):

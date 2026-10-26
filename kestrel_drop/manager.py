@@ -32,7 +32,7 @@ _ble_call = devices.ble_call
 _collection = ContextVar("collection", default=None)
 
 
-async def discover(timeout=15, *, identify=False, register_to=None):
+async def discover(timeout=5, *, identify=False, register_to=None):
     snapshot = await devices.scan_snapshot(timeout)
     found = devices.candidates(snapshot)
     if identify or register_to is not None:
@@ -305,7 +305,7 @@ def parser():
     sub = ap.add_subparsers(dest='command')
     sub.add_parser('tui', help='交互式终端界面')
     scan = sub.add_parser('scan', help='扫描附近 DROP；默认只看广播，可选核验/登记')
-    scan.add_argument('--timeout', type=float, default=15)
+    scan.add_argument('--timeout', type=float, default=5, help='广播扫描秒数，默认 5；设备较多或信号较弱可设 20')
     scan.add_argument('--identify', action='store_true', help='逐台连接，只读核验型号与序列号')
     scan.add_argument('--register', action='store_true', help='逐台核验并登记到本地设备库，不下载历史')
     for name, help_text in (('identify', '只读查询型号与序列号'), ('register', '只读核验并登记设备')):

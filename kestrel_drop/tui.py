@@ -22,7 +22,7 @@ from .worker import Job
 from .ui_text import clip, text_width, wrap_lines, input_window
 from .ui_actions import format_interval, setting_change, retry_download_arguments
 
-PHASES = {'scanning': '扫描附近设备', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
+PHASES = {'scanning': '扫描附近设备', 'locating': '定位已知设备（发现即连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
           'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
           'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库'}
 STATUSES = {'downloaded': '已保存', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
@@ -127,7 +127,7 @@ class Terminal:
             self.message=f'无法启动后台任务：{exc}'
             self.logs.append(self.message)
             return False
-        self.message = {'scan': '正在扫描蓝牙广播…', 'list': '正在读取本地档案…',
+        self.message = {'scan': '正在长扫描（20 秒）…' if '--timeout' in arguments else '正在快速扫描（5 秒）…', 'list': '正在读取本地档案…',
                         'download': '正在连接设备；c 可取消并保留已落盘数据…'}.get(action, '正在处理…')
         self.logs.append('> ' + ' '.join(arguments))
         return True
@@ -348,7 +348,8 @@ class Terminal:
             self.text_offset=max(0,len(self.wrapped_text())-self.screen.getmaxyx()[0]+4)
         else:
             self.text_view=[
-                '快速开始：s 扫描 → ↑↓ 选择 → Enter 下载 → e 导出。',
+                '快速开始：s 快速扫描 5 秒 → ↑↓ 选择 → Enter 下载 → e 导出。',
+                '漏扫时按大写 S 长扫描 20 秒；已知地址按目标定位，发现即连接。',
                 '首次读取最早仍保留的历史，以后只下载新增；设备中的旧记录不会自动删除。',
                 '编号未知：选择该行按 x 连接核验；已知编号仍会在下载前再次核对。',
                 '批量：空格勾选，Ctrl+A 勾选本次附近可采集项，u 清空勾选，a 开始。',
@@ -508,8 +509,8 @@ class Terminal:
                     self.message = f'已打开：{self.library.root}'
                 else:
                     self.message = '尚未建立数据目录；首次下载后即可打开'
-            elif key == 's':
-                self.start('scan', ['scan'])
+            elif key in ('s', 'S'):
+                self.start('scan', ['scan'] if key=='s' else ['scan','--timeout','20'])
             elif key == 'r':
                 self.start('list', ['list'])
             elif key == 'b':
@@ -661,7 +662,7 @@ class Terminal:
         self.put(row+2,self.progress or ('执行中 '+ '|/-\\'[int(time.monotonic()*4)%4] if self.job else '等待操作'))
         log_start=row+4
         for offset,line in enumerate(list(self.logs)[-max(1,height-log_start-3):]):self.put(log_start+offset,line,curses.A_DIM)
-        self.put(height-2,'Enter 下载  s 扫描  空格勾选 / a 批量  g 配置  v 查看  e 导出')
+        self.put(height-2,'Enter 下载  s 快扫 / S 长扫  空格 / a 批量  g 配置  v 查看  e 导出')
         self.put(height-1,'Ctrl+A 全选附近  u 清选择  j 并发  b 备份  l 日志  ? 帮助  q 退出',curses.A_DIM)
 
     def draw_preview(self,height,width):
