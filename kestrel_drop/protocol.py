@@ -339,13 +339,13 @@ def decode_capture(args):
             request={'time':p.timestamp,'attr_handle':f'0x{p.attr_handle:04x}',**f.to_json()}
             if f.kind==0 and len(f.payload)>=6:
                 request['operation']=int.from_bytes(f.payload[:2],'little')
-                request['cursor_uint32_le']=int.from_bytes(f.payload[2:6],'little')
+                request['cursor_uint64_le']=int.from_bytes(f.payload[2:10],'little')
             requests.append(request)
         except ValueError:
             pass
     # Find completion control messages emitted by the device.
     completions=[{'operation':int.from_bytes(f.payload[:2],'little'),
-                  'next_cursor':int.from_bytes(f.payload[2:6],'little')}
+                  'next_cursor':int.from_bytes(f.payload[2:10],'little')}
                  for f in frames if f.kind==0 and len(f.payload)>=6]
     statuses=[int.from_bytes(f.payload,'little') for f in frames if f.kind==3 and len(f.payload)==4]
     report={
@@ -358,10 +358,9 @@ def decode_capture(args):
         'first_record':rows[0]['timestamp_device_local'],'last_record':rows[-1]['timestamp_device_local'],
         'status_record_counts':statuses,'completion_messages':completions,
         'captured_commands':requests,'comparison':comparison,
-        'decoder_limitations':['Record layout and all values validated on one D3 capture only',
-                               'Unknown 1-byte record field not assigned meaning',
-                               'D2 layout unverified',
-                               'Incremental sync has simulated tests but awaits D3 field verification']}
+        'decoder_limitations':['Offline capture decoding assumes the D3 layout; use the manager for D1/D2',
+                               'Legacy unknown_byte column preserves the high byte of signed 24-bit heat index',
+                               'Field definitions follow the supplied official LiNK and Weather protocols']}
     write_csv(out/'decoded_history.csv', rows)
     write_csv(out/'comparison.csv', comparisons)
     write_csv(out/'att_timeline.csv',[{'timestamp_packetlogger':p.timestamp,
@@ -458,7 +457,7 @@ class TransferProgress:
 
 
 class BleSession:
-    """Reverse-engineered history client with per-model captured schemas."""
+    """Official LiNK mass-transfer client with model-specific schema validation."""
     def __init__(self,client, *, model=None):
         from .layouts import profile
         self.layout = profile(model or 'D3')
@@ -469,10 +468,18 @@ class BleSession:
 
     def callback(self,_ch,payload):
         for frame in self.parser.feed(bytes(payload)):
-            self.queue.put_nowait(frame)
+            if self.require_schema and len(frame.payload)+6>128:
+                self.parser.errors.append('DROP decoded frame exceeds official 128-byte limit')
+            else: self.queue.put_nowait(frame)
 
     async def send(self,kind:int,payload:bytes):
-        await self.client.write_gatt_char(DOWN_UUID,encode_frame(kind,payload),response=True)
+        raw = encode_frame(kind, payload)
+        if self.require_schema:
+            # NK mass-transfer characteristics require fixed 20-byte writes.
+            for offset in range(0, len(raw), 20):
+                await asyncio.wait_for(self.client.write_gatt_char(DOWN_UUID, raw[offset:offset+20].ljust(20, b'\x00'), response=True),15)
+        else:
+            await asyncio.wait_for(self.client.write_gatt_char(DOWN_UUID, raw, response=True),15)
 
     async def next(self,timeout=25) -> Frame:
         if self.parser.errors:
@@ -483,25 +490,51 @@ class BleSession:
             raise BluetoothFailure('等待设备回复超时；已确认的连续记录已保留。') from None
         if self.parser.errors:
             raise TransferError(f'Failed frame integrity: {self.parser.errors}')
+        if frame.kind == 5:
+            if len(frame.payload) < 4: raise TransferError('Malformed LiNK NACK')
+            command = int.from_bytes(frame.payload[:2], 'little')
+            reason = int.from_bytes(frame.payload[2:4], 'little')
+            raise TransferError(f'Device rejected command {command}, LiNK NACK reason {reason}')
         return frame
 
     async def ack(self,operation:int):
         await self.send(4,operation.to_bytes(2,'little'))
 
+    async def read_command(self, command, parameters=b''):
+        await self.send(0, command.to_bytes(2,'little')+parameters)
+        acknowledged=False
+        while True:
+            frame=await self.next()
+            if frame.kind==4:
+                if frame.payload!=command.to_bytes(2,'little'): raise TransferError('Unexpected command ACK')
+                acknowledged=True
+                continue
+            if frame.kind==3:
+                if not acknowledged: raise TransferError('Data arrived before matching command ACK')
+                await self.ack(0xffff)
+                return frame.payload
+            raise TransferError('Unexpected response to single-value command')
+
+    async def write_command(self, command, parameters=b''):
+        await self.send(0,command.to_bytes(2,'little')+parameters)
+        frame=await self.next()
+        if frame.kind!=4 or frame.payload!=command.to_bytes(2,'little'):
+            raise TransferError('Command write was not acknowledged')
+
     async def query_count(self,cursor:int) -> int:
-        await self.send(0,(3).to_bytes(2,'little')+cursor.to_bytes(4,'little')+b'\x00'*4)
+        await self.send(0,(3).to_bytes(2,'little')+cursor.to_bytes(8,'little'))
         while True:
             fr=await self.next()
             if fr.kind==4:continue
             if fr.kind==3 and len(fr.payload)==4:
                 count=int.from_bytes(fr.payload,'little')
-                await self.ack(3)
+                await self.ack(0xffff if self.require_schema else 3)
                 return count
             raise RuntimeError(f'Unexpected response during query: {fr.to_json()}')
 
     async def download_from_cursor(self,cursor:int,expected:int,maxrows:int,
                                    progress: TransferProgress | None = None, on_block=None, on_complete=None):
-        await self.send(0,(5).to_bytes(2,'little')+cursor.to_bytes(4,'little')+b'\x00'*4)
+        await self.send(0,(5).to_bytes(2,'little')+cursor.to_bytes(8,'little'))
         rows=[];blocks=[];next_cursor=None
         seen=set()
         schema_seen=False
@@ -515,14 +548,14 @@ class BleSession:
                 schema_seen=True
                 # The observed original LiNK client acknowledges the field schema
                 # using opcode 05 before blocks are sent.
-                await self.ack(5)
+                await self.ack(0xffff if self.require_schema else 5)
                 continue
             if frame.kind==3 and len(frame.payload)>2 and (len(frame.payload)-2)%self.layout.record_bytes==0:
                 if self.require_schema and not schema_seen:
                     raise TransferError('History block arrived without a verified schema')
                 try:
                     new,meta=log_rows_from_frames([frame], model=self.layout.kind)
-                    _check_order(new)
+                    if not self.require_schema: _check_order(new)
                 except (ValueError, RuntimeError) as exc:
                     raise TransferError(f'Invalid record block: {exc}') from exc
                 seq=meta[0]['block']
@@ -530,7 +563,7 @@ class BleSession:
                 # Observed D3 transfers start at zero, including absolute-cursor resumes.
                 if seq != len(blocks):
                     raise TransferError(f'Missing or out-of-order log blocks: expected {len(blocks)}, got {seq}')
-                if rows and new[0]['timestamp_device_local'] < rows[-1]['timestamp_device_local']:
+                if not self.require_schema and rows and new[0]['timestamp_device_local'] < rows[-1]['timestamp_device_local']:
                     raise TransferError('History timestamps go backwards between blocks')
                 if len(rows)+len(new)>maxrows:raise RuntimeError('Exceeded configured record limit')
                 if on_block is not None:
@@ -538,10 +571,14 @@ class BleSession:
                 seen.add(seq);rows.extend(new);blocks.extend(meta)
                 if progress is not None:
                     progress.update(len(rows))
-                await self.ack(5)
+                await self.ack(0xffff if self.require_schema else 5)
                 continue
             if frame.kind==0 and len(frame.payload)>=6 and frame.payload[:2]==b'\x12\x00':
-                next_cursor=int.from_bytes(frame.payload[2:6],'little')
+                if len(frame.payload) not in ((10,) if self.require_schema else (6, 10)):
+                    raise TransferError('Completion must contain a 64-bit sequence number')
+                next_cursor=int.from_bytes(frame.payload[2:],'little')
+                if next_cursor > (1 << 63) - 1:
+                    raise TransferError('Sequence exceeds SQLite signed 64-bit range')
                 if not rows or len(rows) < expected or (cursor != 0 and next_cursor != cursor + len(rows)) or next_cursor < len(rows):
                     raise TransferError('Invalid or incomplete final completion cursor; nothing published')
                 if on_complete is not None:
@@ -562,8 +599,8 @@ class BleSession:
             # request at cursor 0 can mean "oldest still retained" when the
             # log has already rotated. The completion cursor then is NOT
             # necessarily equal to the requested zero + returned row count.
-            # This is a hypothesis informed by the real iPhone capture; it
-            # must be reported explicitly instead of throwing away all rows.
+            # The official sequence number never resets; infer the retained start
+            # from the final sequence instead of assuming the first sequence is zero.
             if cursor != 0 or next_cursor < len(rows):
                 raise RuntimeError(
                     f'Unexpected completion cursor: device says {next_cursor}, '
@@ -574,7 +611,7 @@ class BleSession:
 
 
 def verify_completed_transfer(*, rows, blocks, initial_count: int, requested_cursor: int,
-                              next_cursor: int, elapsed_seconds: float, maxrows: int) -> dict:
+                              next_cursor: int, elapsed_seconds: float, maxrows: int, allow_clock_changes=False) -> dict:
     """Check a completed BLE log transfer, allowing fresh records appended during sync.
 
     Accepting a larger row count is deliberate and bounded by the observed
@@ -598,7 +635,7 @@ def verify_completed_transfer(*, rows, blocks, initial_count: int, requested_cur
         raise RuntimeError('Number of records does not match block metadata')
 
     timestamps = [datetime.fromisoformat(row['timestamp_device_local']) for row in rows]
-    if timestamps != sorted(timestamps):
+    if not allow_clock_changes and timestamps != sorted(timestamps):
         raise RuntimeError('History timestamps are out of chronological order')
     sampled_times = timestamps[-129:]
     differences = [(b-a).total_seconds() for a,b in zip(sampled_times, sampled_times[1:])]
@@ -626,6 +663,7 @@ def verify_completed_transfer(*, rows, blocks, initial_count: int, requested_cur
                 'Do not silently accept these records.')
 
     return {
+        'clock_regressions': sum(b < a for a,b in zip(timestamps,timestamps[1:])),
         'query_count_at_start': initial_count,
         'actual_received_records': actual,
         'new_records_during_transfer': extra,

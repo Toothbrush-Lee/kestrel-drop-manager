@@ -59,7 +59,7 @@ class DatabaseTests(unittest.TestCase):
     def test_typed_schema_has_no_duplicate_json_or_csv_authority(self):
         with self.library.store.connect() as c:
             tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            self.assertEqual(tables, {'devices','histories','transfers','pending_blocks','observations'})
+            self.assertEqual(tables, {'devices','histories','transfers','pending_blocks','observations','device_actions'})
             self.assertNotIn('row_json', {r[1] for r in c.execute('PRAGMA table_info(observations)')})
         self.assertFalse(list(self.library.root.rglob('*.csv')))
         self.assertEqual(self.library.database_info()['records'], 3)
@@ -107,8 +107,8 @@ class DatabaseTests(unittest.TestCase):
         checked = []
         class Client(original):
             async def write_gatt_char(self, uuid, packet, response):
-                frame = protocol.decode_frame(packet[1:-1])
-                if frame.kind == 4 and frame.payload == b'\x05\x00' and self.phase == 1:
+                frame = protocol.FrameStream().feed(packet)[0]
+                if frame.kind == 4 and frame.payload == b'\xff\xff' and self.phase == 1:
                     # Independent read-only connection sees the durable commit.
                     checked.append(Store(owner.library.database_path).resume('2866855')[0])
                 return await super().write_gatt_char(uuid, packet, response)
@@ -123,7 +123,7 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError): self.download(fake)
         self.assertEqual(self.library.store.resume('2866855')[0],103)
         # Schema ACK only, no record ACK after failed commit.
-        self.assertEqual(len([f for f in fake.writes if f.kind == 4 and f.payload == b'\x05\x00']),1)
+        self.assertEqual(len([f for f in fake.writes if f.kind == 4 and f.payload == b'\xff\xff']),2)
 
     def test_backup_with_pending_restores_and_resumes_without_other_files(self):
         self.pending()
@@ -536,7 +536,7 @@ class FinalAckTests(unittest.TestCase):
         checked=[]
         class Client(original):
             async def write_gatt_char(self,uuid,packet,response):
-                frame=protocol.decode_frame(packet[1:-1])
+                frame=protocol.FrameStream().feed(packet)[0]
                 if frame.kind==4 and frame.payload==b'\x12\x00':
                     info=Library(owner.library.root).status()[0]
                     checked.append((info['next_cursor'],info['database_records'],info['pending_records']))
@@ -572,7 +572,7 @@ class FinalAckTests(unittest.TestCase):
         original=fake.module.BleakClient
         class Client(original):
             async def write_gatt_char(self,uuid,packet,response):
-                frame=protocol.decode_frame(packet[1:-1])
+                frame=protocol.FrameStream().feed(packet)[0]
                 if frame.kind==4 and frame.payload==b'\x12\x00':
                     raise fake.errors.BleakError('disconnected after publication')
                 return await super().write_gatt_char(uuid,packet,response)

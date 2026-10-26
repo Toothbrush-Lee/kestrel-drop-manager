@@ -114,6 +114,8 @@ async def resolve(args):
         raise DeviceMismatch('附近存在重复序列号或 BLE 地址，无法唯一选择设备；请按 BLE 地址逐台核验')
     if candidates:
         return candidates[0]
+    if snapshot is not None and not getattr(args,'allow_rescan',True):
+        raise BluetoothFailure(f'DROP {expected or target} not in shared scan; retry with a new scan. No GATT commands were sent.')
     if snapshot is not None:
         return await resolve(SimpleNamespace(serial=expected, ble_id=target, scan_timeout=timeout))
     raise BluetoothFailure(f'DROP {expected or target} not seen during a {timeout:g}s BLE scan. '

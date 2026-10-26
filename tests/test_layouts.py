@@ -32,7 +32,7 @@ class UpgradeTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.path=Path(self.tmp.name)/'library.sqlite'
         with sqlite3.connect(self.path) as c:
-            for statement in SCHEMA:
+            for statement in SCHEMA[:7]:
                 if statement.startswith('CREATE TABLE pending_blocks'):
                     statement=statement.replace('length(payload)>0','length(payload)>0 AND length(payload)%21=0')
                 if statement.startswith('CREATE TABLE observations'):
@@ -60,7 +60,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(len(backups),1);Store(backups[0]).check()
         self.assertEqual(store.query('3'),Store(backups[0]).query('3'))
         self.assertEqual(len(store.query('3')),1)
-        with store.connect() as c: self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],3)
+        with store.connect() as c: self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],4)
         store.ensure_device('1','D1')
         t=store.begin_transfer('1',0,1)
         row=protocol.decode_record(RAW[:9],block=0,position=0,model='D1')
@@ -85,21 +85,21 @@ class ModelTransportTests(unittest.IsolatedAsyncioTestCase):
             sequence=[]
             class Client:
                 async def write_gatt_char(self,uuid,raw,response):
-                    frame=decode_frame(raw[1:-1])
+                    frame=protocol.FrameStream().feed(raw)[0]
                     sequence.append(('write',frame.kind,frame.payload[:2]))
             session=BleSession(Client(),model=model)
             raw=RAW[:width]
             for frame in [Frame(1,profile(model).schema,b''),
                           Frame(3,b'\0\0'+raw,b''),Frame(3,b'\1\0'+raw,b''),
-                          Frame(0,b'\x12\0'+(102).to_bytes(4,'little'),b'')]:
+                          Frame(0,b'\x12\0'+(102).to_bytes(8,'little'),b'')]:
                 session.queue.put_nowait(frame)
             def block(rows,meta): sequence.append(('durable',meta[0]['block'],len(bytes.fromhex(rows[0]['record_hex']))))
             def complete(rows,blocks,cursor): sequence.append(('published',len(rows),cursor))
             rows,_,cursor=await session.download_from_cursor(100,2,20000,on_block=block,on_complete=complete)
             self.assertEqual((len(rows),cursor),(2,102))
-            self.assertEqual(sequence,[('write',0,b'\x05\0'),('write',4,b'\x05\0'),
-                ('durable',0,width),('write',4,b'\x05\0'),('durable',1,width),
-                ('write',4,b'\x05\0'),('published',2,102),('write',4,b'\x12\0')])
+            self.assertEqual(sequence,[('write',0,b'\x05\0'),('write',4,b'\xff\xff'),
+                ('durable',0,width),('write',4,b'\xff\xff'),('durable',1,width),
+                ('write',4,b'\xff\xff'),('published',2,102),('write',4,b'\x12\0')])
 
     async def test_missing_schema_wrong_length_or_write_failure_never_ack_block(self):
         from kestrel_drop.protocol import BleSession, Frame, decode_frame, TransferError
@@ -107,7 +107,7 @@ class ModelTransportTests(unittest.IsolatedAsyncioTestCase):
             for fault in ('missing_schema','wrong_length','disk_failure'):
                 writes=[];blocks=[]
                 class Client:
-                    async def write_gatt_char(self,uuid,raw,response): writes.append(decode_frame(raw[1:-1]))
+                    async def write_gatt_char(self,uuid,raw,response): writes.append(protocol.FrameStream().feed(raw)[0])
                 session=BleSession(Client(),model=model)
                 if fault!='missing_schema':session.queue.put_nowait(Frame(1,profile(model).schema,b''))
                 raw=RAW[:width]+(b'\0' if fault=='wrong_length' else b'')

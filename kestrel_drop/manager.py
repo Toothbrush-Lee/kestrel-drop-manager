@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import csv
 from datetime import datetime, timedelta
+from contextlib import contextmanager
+from contextvars import ContextVar
 import os
 from pathlib import Path
 import re
@@ -17,16 +19,17 @@ import sys
 from types import SimpleNamespace
 import uuid
 
-from . import protocol
+from . import protocol, __version__
 from .database import Store, FIELDS
 from .storage import default_root, writer_lock, legacy_archives, migrate, configure
 from . import events
-from .errors import MigrationRequired, describe
+from .errors import MigrationRequired, ConfigurationFailure, describe
 
 from . import devices
 from .devices import DROP_SERVICE, serial_number
 
 _ble_call = devices.ble_call
+_collection = ContextVar("collection", default=None)
 
 
 async def discover(timeout=15, *, identify=False, register_to=None):
@@ -141,53 +144,125 @@ class Library:
         if not execute:
             print(f'预演：设备 {serial}；实际下载请加 --execute。未发送蓝牙指令。')
             return 0
+        owner = _collection.get()
+        if owner is not None and owner[0] is self:
+            return await self._download_locked(serial, owner[1], ble_id=ble_id, timeout=timeout,
+                                               maxrows=maxrows, progress_factory=progress_factory, discovery=discovery)
         with writer_lock(self.root):
             store = self._writable_store()
-            try:
-                before = store.device(serial)['row_count']
-            except FileNotFoundError:
-                before = 0
-            args = SimpleNamespace(serial=serial, ble_id=ble_id, scan_timeout=timeout, discovery=discovery)
-            from bleak import BleakClient
-            device = await _ble_call(protocol.resolve_ble_device, args)
-            events.emit('phase', serial=serial, phase='connecting')
-            async def connected():
-                async with BleakClient(device, timeout=30) as client:
-                    events.emit('phase', serial=serial, phase='identifying')
-                    identity = await devices.read_identity(client, ble_id=getattr(device, 'address', ble_id))
-                    devices.require_identity(identity, expected=serial, history=True)
-                    store.ensure_device(serial, devices.canonical_model(identity['model']))
-                    cursor, pending = store.resume(serial)
-                    session = protocol.BleSession(client, model=identity['model'])
-                    await client.start_notify(protocol.UP_UUID, session.callback)
+            return await self._download_locked(serial, store, ble_id=ble_id, timeout=timeout,
+                                               maxrows=maxrows, progress_factory=progress_factory, discovery=discovery)
+
+    async def _download_locked(self, serial, store, *, ble_id, timeout, maxrows, progress_factory, discovery):
+        try:
+            before = store.device(serial)['row_count']
+        except FileNotFoundError:
+            before = 0
+        owner=_collection.get()
+        args = SimpleNamespace(serial=serial, ble_id=ble_id, scan_timeout=timeout, discovery=discovery,
+                               allow_rescan=not (owner is not None and owner[2]>1))
+        from bleak import BleakClient
+        device = await _ble_call(protocol.resolve_ble_device, args)
+        events.emit('phase', serial=serial, phase='connecting')
+        async def connected():
+            async with BleakClient(device, timeout=30) as client:
+                events.emit('phase', serial=serial, phase='identifying')
+                identity = await devices.read_identity(client, ble_id=getattr(device, 'address', ble_id))
+                devices.require_identity(identity, expected=serial, history=True)
+                store.ensure_device(serial, devices.canonical_model(identity['model']))
+                cursor, pending = store.resume(serial)
+                session = protocol.BleSession(client, model=identity['model'])
+                await client.start_notify(protocol.UP_UUID, session.callback)
+                try:
+                    events.emit('phase', serial=serial, phase='querying')
+                    count = await session.query_count(cursor)
+                    if not count:
+                        return 3 if pending or any(d['serial'] == serial and d['pending_records'] for d in store.status()) else 0
+                    if count > maxrows:
+                        raise RuntimeError('设备报告的记录数超过 --maxrows；可能存在历史缺口，未继续读取')
+                    transfer_id = store.begin_transfer(serial, cursor, count)
+                    progress = (progress_factory or (lambda n: protocol.TransferProgress(n, log_seconds=0.5)))(count)
+                    started = time.monotonic()
                     try:
-                        events.emit('phase', serial=serial, phase='querying')
-                        count = await session.query_count(cursor)
-                        if not count:
-                            return 3 if pending or any(d['serial'] == serial and d['pending_records'] for d in store.status()) else 0
-                        if count > maxrows:
-                            raise RuntimeError('设备报告的记录数超过 --maxrows；可能存在历史缺口，未继续读取')
-                        transfer_id = store.begin_transfer(serial, cursor, count)
-                        progress = (progress_factory or (lambda n: protocol.TransferProgress(n, log_seconds=0.5)))(count)
-                        started = time.monotonic()
-                        try:
-                            events.emit('phase', serial=serial, phase='receiving')
-                            def complete(rows, blocks, final):
-                                events.emit('phase', serial=serial, phase='verifying')
-                                events.emit('phase', serial=serial, phase='saving')
-                                store.finish_transfer(transfer_id, next_cursor=final, elapsed_seconds=time.monotonic()-started,
-                                                      maxrows=maxrows, received_rows=rows)
-                            await session.download_from_cursor(cursor, count, maxrows, progress=progress,
-                                on_block=lambda rows, blocks: store.append_block(transfer_id, rows, blocks), on_complete=complete)
-                            progress.finish(success=True)
-                        except BaseException:
-                            progress.finish(success=False, partial_saved=True)
-                            raise
-                        return 0
-                    finally:
-                        await client.stop_notify(protocol.UP_UUID)
-            result = await _ble_call(connected)
-            return self.complete_download(serial, previous=before, code=result)
+                        events.emit('phase', serial=serial, phase='receiving')
+                        def complete(rows, blocks, final):
+                            events.emit('phase', serial=serial, phase='verifying')
+                            events.emit('phase', serial=serial, phase='saving')
+                            store.finish_transfer(transfer_id, next_cursor=final, elapsed_seconds=time.monotonic()-started,
+                                                  maxrows=maxrows, received_rows=rows)
+                        await session.download_from_cursor(cursor, count, maxrows, progress=progress,
+                            on_block=lambda rows, blocks: store.append_block(transfer_id, rows, blocks), on_complete=complete)
+                        progress.finish(success=True)
+                    except BaseException:
+                        progress.finish(success=False, partial_saved=True)
+                        raise
+                    return 0
+                finally:
+                    primary_error=sys.exc_info()[0] is not None
+                    try: await client.stop_notify(protocol.UP_UUID)
+                    except Exception:
+                        if not primary_error: raise
+        result = await _ble_call(connected)
+        return self.complete_download(serial, previous=before, code=result)
+
+    async def device_operation(self, serial, *, ble_id=None, timeout=20, changes=None, execute=False, blink=False, samples=0, period=2):
+        from . import control
+        serial = serial_number(serial)
+        if timeout <= 0 or not 0 <= samples <= 10000 or not 0.2 <= period <= 3600:
+            raise ValueError('设备查询参数超出有效范围')
+        if changes is not None:
+            changes = control.validate_changes(changes)
+            if not execute: return {'serial':serial,'status':'dry_run','changes':changes,'note':'未访问蓝牙；--execute 后逐项写入并回读验证'}
+        if blink and not execute: return {'serial':serial,'status':'dry_run','action':'blink','note':'--execute 后闪灯定位'}
+        # One directory owner prevents simultaneous download/configuration of a device.
+        with writer_lock(self.root):
+            device = await devices.resolve(SimpleNamespace(serial=serial,ble_id=ble_id,scan_timeout=timeout))
+            from bleak import BleakClient
+            events.emit('phase',serial=serial,phase='connecting')
+            async def connected():
+                async with BleakClient(device,timeout=30) as client:
+                    events.emit('phase',serial=serial,phase='identifying')
+                    identity = await devices.read_identity(client,ble_id=device.address)
+                    devices.require_identity(identity,expected=serial)
+                    if changes and 'reference_altitude_m' in changes and identity['device_type']!='D3':
+                        raise ValueError('参考海拔用于 D3 气压计算，此型号不适用；未发送设置指令')
+                    if samples:
+                        values=[]
+                        for index in range(samples):
+                            sample={'serial':serial,**await control.live(client)}
+                            events.emit('sample',**sample);values.append(sample)
+                            if index+1 < samples: await asyncio.sleep(period)
+                        return {'serial':serial,'samples':values,'stored':False}
+                    before=await control.inspect(client)
+                    result={**identity,**before}
+                    if changes is None and not blink: return result
+                    store=self._writable_store()
+                    store.register_device(serial,identity['model'])
+                    action=store.begin_action(serial,changes or {'blink':True},result)
+                    try:
+                        if blink:
+                            payload=bytearray(20);payload[1]=1
+                            await asyncio.wait_for(client.write_gatt_char(control.COMMANDS_UUID,bytes(payload),response=True),15)
+                            after={'command_acknowledged':True,'visual_confirmation_required':True}
+                        else: after=await control.apply(client,changes,before)
+                        store.finish_action(action,after=after)
+                        return {'serial':serial,'status':'verified','action_id':action,'before':result,'after':after}
+                    except BaseException as exc:
+                        store.finish_action(action,error=f'{type(exc).__name__}: {exc}; device may have changed; read back before retry')
+                        if isinstance(exc, asyncio.CancelledError): raise
+                        raise ConfigurationFailure(str(exc)) from exc
+            return await _ble_call(connected)
+
+    @contextmanager
+    def collection(self, execute, *, parallel=1):
+        if not execute:
+            yield
+            return
+        with writer_lock(self.root):
+            store=self._writable_store()
+            token=_collection.set((self,store,parallel))
+            try: yield
+            finally: _collection.reset(token)
 
     def records(self, serial, limit=30):
         if limit < 1: raise ValueError('条数必须大于 0')
@@ -203,7 +278,7 @@ class Library:
         if end_exclusive: end += timedelta(days=1)
         selected = self.query_store(serial).query(serial_number(serial), since=start.isoformat(sep=' ') if start else None,
             until=end.isoformat(sep=' ') if end else None, end_exclusive=end_exclusive)
-        names = ['serial', 'history_generation', 'absolute_cursor', *FIELDS]
+        names = ['serial', 'history_generation', 'absolute_cursor', 'device_sequence', *FIELDS]
         destination = Path(destination).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
         import tempfile
@@ -224,6 +299,7 @@ class Library:
 def parser():
     import argparse
     ap = argparse.ArgumentParser(description='Kestrel DROP 多设备识别与 D1/D2/D3 下载管理（默认打开中文 TUI）')
+    ap.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     ap.add_argument('--data-dir', default=None, help='数据目录；优先使用已保存位置或 KESTREL_DATA_DIR')
     ap.add_argument('--events-json', action='store_true', help='输出版本化 JSON Lines 事件，供 TUI / 自动化使用')
     sub = ap.add_subparsers(dest='command')
@@ -252,13 +328,34 @@ def parser():
     download = sub.add_parser('download', help='首次完整下载或自动增量同步')
     target = download.add_mutually_exclusive_group(required=True)
     target.add_argument('--serial', type=serial_number)
-    target.add_argument('--serials', nargs='+', type=serial_number, help='按列表依次采集多个设备')
-    target.add_argument('--all', action='store_true', help='依次处理全部登记设备，含空档案和首次中断；失败后继续')
+    target.add_argument('--serials', nargs='+', type=serial_number, help='按列表采集多个设备，可设置并发数')
+    target.add_argument('--all', action='store_true', help='处理全部登记设备，含空档案和首次中断；失败后继续')
     download.add_argument('--ble-id', help='单设备 BLE 地址或 UUID')
     download.add_argument('--ble-ids', nargs='+', help='与 --serials 一一对应的临时连接地址；- 表示按编号寻找')
     download.add_argument('--timeout', type=float, default=20)
     download.add_argument('--maxrows', type=int, default=20000)
+    download.add_argument('--parallel', type=int, default=1, help='并发连接数 1–8；建议从 2 开始')
     download.add_argument('--execute', action='store_true', help='执行设备历史读取指令')
+    sub.add_parser('overview', help='关联设备、条数、游标和最近下载时间的只读总览')
+    audit=sub.add_parser('actions',help='只读查看设备配置审计记录')
+    audit.add_argument('serial',type=serial_number)
+    audit.add_argument('--limit',type=int,default=20)
+    for command, help_text in (('device','读取设备设置、时间、电量与固件'),('set','配置设备，默认预演'),('blink','闪灯定位设备，默认预演'),('live','读取实时测量，不入历史库')):
+        device = sub.add_parser(command,help=help_text)
+        device.add_argument('serial',type=serial_number)
+        device.add_argument('--ble-id')
+        device.add_argument('--timeout',type=float,default=20)
+        if command in ('set','blink'): device.add_argument('--execute',action='store_true')
+        if command=='set':
+            device.add_argument('--interval',type=int)
+            device.add_argument('--wrap',choices=('on','off'))
+            device.add_argument('--update-seconds',type=int)
+            device.add_argument('--reference-altitude',type=int)
+            device.add_argument('--name')
+            device.add_argument('--time',help='设备本地时间 ISO 格式，或 now 使用电脑当前本地时间')
+        if command=='live':
+            device.add_argument('--samples',type=int,default=1)
+            device.add_argument('--period',type=float,default=2)
     imp = sub.add_parser('import', help='验证旧完整 CSV 与 .csv.json 并入库，不改源文件')
     imp.add_argument('csv', type=Path)
     imp.add_argument('--metadata', type=Path)
@@ -342,7 +439,21 @@ def _run(args):
                       'output': str(args.output.expanduser().resolve())}
         elif args.command == 'records':
             result = library.records(args.serial, args.limit)
+        elif args.command == 'actions':
+            result=library.store.actions(args.serial,args.limit)
+        elif args.command == 'overview':
+            result=library.store.overview()
+        elif args.command in ('device','set','blink','live'):
+            changes=None
+            if args.command=='set':
+                changes={key:value for key,value in [('interval_seconds',args.interval),('wrap',None if args.wrap is None else args.wrap=='on'),
+                    ('update_seconds',args.update_seconds),('reference_altitude_m',args.reference_altitude),('name',args.name),('time',args.time)] if value is not None}
+            if args.command=='live' and args.samples < 1: raise ValueError('实时样本数必须为 1–10000')
+            result=asyncio.run(library.device_operation(args.serial,ble_id=args.ble_id,timeout=args.timeout,
+                changes=changes,execute=getattr(args,'execute',False),blink=args.command=='blink',
+                samples=getattr(args,'samples',0),period=getattr(args,'period',2)))
         elif args.command == 'download':
+            if not 1 <= args.parallel <= 8: raise ValueError('并发连接数必须为 1–8')
             if args.ble_ids and (not args.serials or len(args.ble_ids) != len(args.serials)):
                 raise ValueError('--ble-ids 必须与 --serials 数量相同')
             if (args.all or args.serials) and args.ble_id:
@@ -370,7 +481,17 @@ def _run(args):
                         snapshot = await devices.scan_snapshot(args.timeout)
                     except (OSError, RuntimeError, ValueError) as exc:
                         scan_error = exc
-                for serial in serials:
+                semaphore=asyncio.Semaphore(args.parallel)
+                stopped=asyncio.Event()
+                async def worker(serial):
+                    async with semaphore:
+                        if stopped.is_set(): raise asyncio.CancelledError()
+                        try:
+                            await collect(serial)
+                        except BaseException:
+                            stopped.set()
+                            raise
+                async def collect(serial):
                     try:
                         if scan_error is not None:
                             raise scan_error
@@ -383,11 +504,21 @@ def _run(args):
                             events.emit('error', serial=serial, code='completion_pending', retryable=True,
                                         message='部分暂存数据缺少设备完成确认，尚未发布。', action='等待设备产生新样本后重试，保留数据库。')
                     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                        if asyncio.current_task().cancelling(): raise asyncio.CancelledError() from exc
                         failure = {'serial': serial, **describe(exc)}
                         failures.append(failure)
                         outcomes.append({'serial': serial, 'status': 'failed', 'error': failure})
                         events.emit('error', **failure)
                         print(f'设备 {serial} 失败：{exc}', file=__import__('sys').stderr)
+                with library.collection(args.execute,parallel=args.parallel):
+                    tasks=[asyncio.create_task(worker(serial)) for serial in serials]
+                    try: await asyncio.gather(*tasks)
+                    finally:
+                        for task in tasks:
+                            if not task.done(): task.cancel()
+                        await asyncio.gather(*tasks,return_exceptions=True)
+                # Return a stable result order even when transfers finish out of order.
+                outcomes.sort(key=lambda item: serials.index(item['serial']))
             asyncio.run(batch())
             events.result({'downloads': outcomes, 'incomplete': failures})
             if failures:

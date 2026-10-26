@@ -19,3 +19,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Vendor-provided protocol documents stay local.
+/KestrelDocuments/

@@ -1,7 +1,7 @@
 """Data location, directory writer lock, and explicit legacy migration.
 
 Legacy recovery runs only on a disposable copy. Source files are retired only
-after a verified schema-2 database is durably published, and only if unchanged.
+after a verified current-schema database is durably published, and only if unchanged.
 """
 from contextlib import contextmanager, ExitStack, closing
 from datetime import datetime
@@ -133,8 +133,8 @@ def migrate(root):
         if database.exists():
             with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as connection:
                 version = connection.execute('PRAGMA user_version').fetchone()[0]
-            if version in (2, SCHEMA_VERSION):
-                result = Store(database, create=version == 2).check()
+            if version in (2, 3, SCHEMA_VERSION):
+                result = Store(database, create=version in (2, 3)).check()
                 leftovers = []
                 for manifest_path in (root / 'legacy').glob('migration-*/manifest.json'):
                     meta = json.loads(manifest_path.read_text())

@@ -36,6 +36,8 @@ class FakeBLE:
         class Client:
             def __init__(self, *args, **kwargs):
                 self.phase = 0
+                self.frames = protocol.FrameStream()
+                self.downloading = False
 
             async def __aenter__(self):
                 return self
@@ -56,22 +58,25 @@ class FakeBLE:
                 self.callback(None, protocol.encode_frame(kind, payload))
 
             async def write_gatt_char(self, uuid, raw, response):
-                frame = protocol.decode_frame(raw[1:-1])
+                frames = self.frames.feed(raw)
+                if not frames: return
+                frame = frames[0]
                 owner.writes.append(frame)
                 if frame.kind == 0 and frame.payload[:2] == b'\x03\x00':
                     self.transmit(4, b'\x03\x00')
                     self.transmit(3, len(owner.rows).to_bytes(4, 'little'))
                 elif frame.kind == 0 and frame.payload[:2] == b'\x05\x00':
+                    self.downloading = True
                     self.transmit(4, b'\x05\x00')
                     from kestrel_drop.layouts import profile
                     self.transmit(1, owner.schema if owner.schema is not None else profile(owner.model).schema)
-                elif frame.kind == 4 and frame.payload == b'\x05\x00':
+                elif frame.kind == 4 and frame.payload in (b'\x05\x00', b'\xff\xff') and self.downloading:
                     if self.phase == 0:
                         self.transmit(3, b'\x00\x00' + b''.join(owner.rows))
                     else:
                         if owner.interrupt:
                             raise asyncio.CancelledError()
-                        self.transmit(0, b'\x12\x00' + owner.cursor.to_bytes(4, 'little'))
+                        self.transmit(0, b'\x12\x00' + owner.cursor.to_bytes(8, 'little'))
                     self.phase += 1
 
         self.module = ModuleType('bleak')
@@ -215,7 +220,7 @@ class LibraryTests(unittest.TestCase):
             fake=FakeBLE([record(20)],101,model=kind,schema=profile(kind).schema+b'\x00')
             with self.assertRaisesRegex(protocol.TransferError,'schema'):
                 self.download(fake,library)
-            self.assertFalse(any(f.kind==4 and f.payload==b'\x05\x00' for f in fake.writes))
+            self.assertEqual(sum(f.kind==4 and f.payload==b'\xff\xff' for f in fake.writes),1)
             self.assertEqual(library.database_info()['records'],0)
 
     def test_empty_device_does_not_publish_empty_archive(self):
@@ -317,7 +322,7 @@ class LibraryTests(unittest.TestCase):
                 raise RuntimeError('unavailable')
             return 0
         with patch.object(manager.Library, 'targets', return_value=['111', '222']), patch.object(manager.Library, 'download', download), patch.object(manager.devices, 'scan_snapshot', return_value={}):
-            self.assertEqual(manager.main(['download', '--all', '--execute']), 2)
+            self.assertEqual(manager.main(['--data-dir',str(self.library.root),'download', '--all', '--execute']), 2)
         self.assertEqual(calls, ['111', '222'])
 
     def test_tui_background_job_reads_json_and_exits(self):

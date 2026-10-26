@@ -18,6 +18,7 @@ import threading
 import time
 import unicodedata
 
+from . import __version__
 from .protocol import TransferProgress
 from .errors import TITLES
 from .devices import model_type
@@ -115,7 +116,7 @@ class Job:
                 try:
                     event = json.loads(line)
                     if not isinstance(event, dict) or event.get('version') != 1 or event.get('event') not in (
-                            'phase', 'progress', 'log', 'error', 'completed', 'result', 'finished'):
+                            'phase', 'progress', 'log', 'error', 'completed', 'result', 'sample', 'finished'):
                         raise ValueError('unknown event schema')
                     if event['event'] == 'finished':
                         self.finished = True
@@ -170,11 +171,35 @@ class Terminal:
         self.text_view = None
         self.text_offset = 0
         self.result_view = None
+        self.device_state = None
+        self.device_progress = {}
+        self.parallel = 1
+        self.last_stamp = None
+        self.list_stamp = None
+        self.next_local_refresh = 0
+
+    def database_stamp(self):
+        result=[]
+        for name in ('library.sqlite','library.sqlite-wal'):
+            try:
+                stat=(self.library.root/name).stat();result.append((stat.st_mtime_ns,stat.st_size))
+            except FileNotFoundError: result.append(None)
+        return tuple(result)
+
+    def refresh_if_changed(self):
+        if time.monotonic() < self.next_local_refresh: return
+        self.next_local_refresh=time.monotonic()+2
+        if self.job or self.form or self.preview is not None or self.text_view is not None or self.result_view is not None or self.device_state is not None: return
+        if self.last_stamp is not None and self.database_stamp()!=self.last_stamp:
+            self.refresh_message='本地数据已更新（自动刷新）'
+            self.start('list',['list'])
 
     def start(self, action, arguments):
         if self.job:
             self.message = '任务执行中；按 c 取消，或等待完成'
             return
+        if action=='list': self.list_stamp=self.database_stamp()
+        if action=='download': self.device_progress={}
         self.action = action
         self.progress = ''
         self.job = Job(self.library.root, arguments)
@@ -201,7 +226,7 @@ class Terminal:
             self.action = None
             self.message = ('已取消；已落盘数据保留，可再次下载' if job.cancelled else
                             '操作完成' if value == 0 else f'操作未完成（退出码 {value}），请查看下方日志')
-            if (value == 0 or (action in ('list', 'scan') and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure', 'register', 'identify'):
+            if (value == 0 or (action in ('list', 'scan') and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'blink', 'live'):
                 try:
                     payload = job.payload
                     if payload is None:
@@ -215,6 +240,7 @@ class Terminal:
                             self.selected = list(self.devices).index(selected_serial)
                         self.message = f'扫描完成：{len(payload)} 个 DROP；x 读取编号并登记 · 空格选择 · a 批量采集'
                     elif action == 'list':
+                        self.last_stamp=self.list_stamp
                         # Clear transient errors and old pending counts on refresh.
                         for device in self.devices.values():
                             for field in ('csv', 'error', 'committed_records', 'pending_records',
@@ -227,6 +253,15 @@ class Terminal:
                         self.message = (f'{failures} 个档案校验或入库失败，请查看选中设备及日志' if failures else
                                         self.refresh_message or f'已读取 {len(payload)} 个设备 · s 扫描 · Enter 下载')
                         self.refresh_message = None
+                    elif action in ('device','set'):
+                        self.device_state = payload if action=='device' else {**payload['before'],**payload['after']}
+                        self.message = '设置已回读验证' if action=='set' else '设备信息已读取；不会自动校时'
+                    elif action == 'blink':
+                        self.message = '已发送闪灯定位，请观察设备 LED'
+                    elif action == 'live':
+                        self.device_state = self.device_state or {'serial':payload['serial']}
+                        self.device_state['live'] = payload['samples'][-1]
+                        self.message='实时测量已读取，不写入历史库'
                     elif action == 'records':
                         self.preview, self.preview_offset = list(reversed(payload)), 0
                     elif action in ('register', 'identify'):
@@ -252,7 +287,7 @@ class Terminal:
                         self.message = f'已导入完整档案：{payload["database"]}（按 l 查看完整路径）'
                 except (ValueError, TypeError, KeyError) as exc:
                     self.message = f'无法读取任务结果：{exc}'
-            if action in ('download', 'import', 'migrate', 'configure', 'register', 'identify'):
+            if action in ('download', 'import', 'migrate', 'configure', 'register', 'identify', 'set'):
                 self.refresh_message = self.message
                 self.start('list', ['list'])
             if action == 'download' or (value and action != 'list'):
@@ -262,6 +297,8 @@ class Terminal:
                 if value and not failures:
                     failures = [{'code': 'worker_failed', 'message': '后台任务未完成。', 'retryable': False,
                                  'action': '按 l 查看日志，检查后台启动或事件通信问题。'}]
+                if action in ('set','blink'):
+                    for failure in failures: failure['retryable']=False
                 self.result_view = {'outcomes': outcomes, 'failures': failures, 'code': value,
                                     'action': action, 'arguments': job.arguments}
                 if len(outcomes) == 1 and outcomes[0]['serial'] in self.devices:
@@ -270,6 +307,8 @@ class Terminal:
 
     def receive_event(self, event):
         kind = event['event']
+        if event.get('serial') and kind in ('phase','progress','completed','error'):
+            self.device_progress.setdefault(event['serial'],{}).update(event)
         if kind == 'log':
             self.logs.append(event['message'])
         elif kind == 'phase':
@@ -283,6 +322,10 @@ class Terminal:
             if self.action in ('export', 'backup', 'import', 'migrate', 'configure', 'register', 'identify'):
                 self.logs.append('结果：' + json.dumps(event['data'], ensure_ascii=False))
         elif kind == 'completed':
+            for item in self.devices.values():
+                if item.get('serial')==event['serial']:
+                    item.update(database_records=event['total_records'],committed_records=event['total_records'],
+                                pending_records=event['pending_records'],last_timestamp=event.get('last_timestamp'))
             self.job.outcomes.append(event)
             self.logs.append(f'{event["serial"]}: {STATUSES.get(event["status"], event["status"])}，'
                              f'新增 {event["added_records"]}，累计 {event["total_records"]}，未确认 {event["pending_records"]}')
@@ -302,7 +345,21 @@ class Terminal:
         values = [field[1].strip() for field in self.form['fields']]
         action = self.form['action']
         try:
-            if action == 'add':
+            if action=='parallel':
+                value=int(values[0])
+                if not 1 <= value <= 8: raise ValueError('并发连接数必须为 1–8，建议从 2 开始')
+                self.parallel=value;self.message=f'本次批量并发上限：{value}'
+            elif action.startswith('set_'):
+                from .control import validate_changes
+                mapping={'set_interval':('interval_seconds','--interval',int),'set_wrap':('wrap','--wrap',lambda v: v=='on' if v in ('on','off') else None),
+                    'set_name':('name','--name',str),'set_time':('time','--time',str),'set_update':('update_seconds','--update-seconds',int),
+                    'set_altitude':('reference_altitude_m','--reference-altitude',int)}
+                field,flag,convert=mapping[action]
+                validate_changes({field:convert(values[0])})
+                args=['set',self.device_state['serial'],flag,values[0],'--execute']
+                if self.device_state.get('ble_id'): args += ['--ble-id',self.device_state['ble_id']]
+                self.start('set',args)
+            elif action == 'add':
                 from .manager import serial_number
                 serial = serial_number(values[0])
                 self.devices[serial] = {**self.devices.get(serial, {}), 'serial': serial,
@@ -351,8 +408,35 @@ class Terminal:
             form['fields'][form['index']][1] += key
 
     def handle(self, key):
+        if self.job and key=='c':
+            self.job.cancel()
+            self.message='正在取消；配置可能部分生效，请在取消后重新读取' if self.action in ('set','blink') else '正在取消，等待连接清理'
+            return True
         if self.form:
             self.handle_form(key)
+            return True
+        if self.device_state is not None and self.result_view is None:
+            if key in ('q','\x1b','\n','\r'):
+                if not self.job: self.device_state=None
+                return True
+            if self.job: return True
+            state=self.device_state;settings=state.get('settings') or {}
+            forms={'1':('采样间隔：输入秒数（2,5,10,20,30,60,120,300,360,600,1200,1800,3600,7200,21600,43200）',settings.get('interval_seconds') or 300,'set_interval'),
+                   '2':('滚动覆盖：on 覆盖最早记录 / off 满后停止记录','on' if settings.get('wrap') else 'off','set_wrap'),
+                   '3':('校时：输入设备本地时间或 now；不会修改旧记录','now','set_time'),
+                   '4':('设备名称：1–20 个可打印 ASCII 字符',state.get('name') or '','set_name'),
+                   '5':('实时更新间隔：2–60 秒',settings.get('update_seconds') or 30,'set_update'),
+                   '6':('气压计算参考海拔：米',settings.get('reference_altitude_m') or 0,'set_altitude')}
+            if key=='6' and (state.get('device_type') or model_type(state.get('model')))!='D3':
+                self.message='此型号没有气压测量，无需配置参考海拔'
+            elif key in forms:
+                title,value,action=forms[key];self.open_form(title,[('新值（Enter 写入并回读）',value)],action)
+            elif key in ('r','w','b'):
+                action={'r':'device','w':'live','b':'blink'}[key]
+                args=[action,state['serial']]
+                if state.get('ble_id'):args+=['--ble-id',state['ble_id']]
+                if action=='blink':args+=['--execute']
+                self.start(action,args)
             return True
         if self.text_view is not None:
             if key in ('q', '\x1b', '\n'):
@@ -409,7 +493,7 @@ class Terminal:
                     'r 只读刷新本地档案；l 查看日志，↑↓ / PgUp / PgDn 滚动。',
                     '首次下载中断：保留在数据库，下次重新读取完整历史。',
                     '增量下载中断：数据库保留待确认块，下次从绝对游标恢复。',
-                    'D1/D2/D3 分别解析历史；字段声明不匹配时拒绝入库。',
+                    'D1/D2/D3 按官方协议解析；g 查看配置，j 设置批量并发数。',
                     '设备时间没有时区；结束日期只写日期时包含当天整天。',
                 ]
                 self.text_offset = 0
@@ -430,7 +514,15 @@ class Terminal:
             self.selected = max(0, self.selected - 1)
         elif not self.job:
             device = self.selected_device()
-            if key == 'm':
+            if key == 'j':
+                self.open_form('设置本次批量并发数（1–8，建议从 2 开始）',[('并发数',self.parallel)],'parallel')
+            elif key == 'g':
+                if not device or not device.get('serial'): self.message='先扫描并按 x 核验编号'
+                else:
+                    args=['device',device['serial']]
+                    if device.get('ble_id'): args+=['--ble-id',device['ble_id']]
+                    self.start('device',args)
+            elif key == 'm':
                 self.start('migrate', ['migrate'])
             elif key == 'p':
                 self.open_form('保存数据位置（不搬动已有数据；新位置可以为空）', [('数据目录', str(self.library.root))], 'configure')
@@ -505,7 +597,9 @@ class Terminal:
                 if skipped:
                     self.logs.append('本次跳过（档案保留）：' + '；'.join(skipped))
                 if targets:
-                    self.start('download', ['download', '--serials', *targets, '--ble-ids', *addresses, '--execute'])
+                    args=['download', '--serials', *targets, '--ble-ids', *addresses, '--execute']
+                    if self.parallel>1:args+=['--parallel',str(self.parallel)]
+                    self.start('download',args)
                 else:
                     self.message = '没有可采集目标；先 s 扫描，离线档案保留。'
             elif key in ('v', 'e'):
@@ -536,7 +630,7 @@ class Terminal:
             self.put(0, '请将终端扩大至至少 68 列 × 18 行；q 退出')
             self.screen.refresh()
             return
-        self.put(0, 'KESTREL DROP  /  电脑下载管理', curses.A_BOLD)
+        self.put(0, f'KESTREL DROP  /  电脑下载管理  {__version__}', curses.A_BOLD)
         self.put(1, f'档案目录：{self.library.root}', curses.A_DIM)
         self.put(2, 'D1/D2/D3 身份识别与历史采集 · 连接前断开手机 LiNK', curses.A_DIM)
         self.put(4, '选 型号  设备序列号          附近    已入库    未确认   状态 / 最新时间', curses.A_BOLD)
@@ -550,6 +644,12 @@ class Terminal:
                      or item.get('last_timestamp') or item.get('identity_error')
                      or ('广播编号；x 核验' + ('，历史待适配' if item.get('history_supported') is False else '') if item.get('serial') and not item.get('identity_verified') else
                          '历史待适配' if item.get('history_supported') is False else '待下载' if item.get('serial') else '按 x 读取编号'))
+            progress=self.device_progress.get(item.get('serial'),{})
+            if self.job and progress.get('event')=='progress':
+                state=f'接收 {progress.get("received",0)}/{progress.get("expected",0)}'
+            elif self.job and progress.get('event')=='phase': state=PHASES.get(progress.get('phase'),state)
+            elif self.job and progress.get('event')=='completed': state=STATUSES.get(progress.get('status'),state)
+            elif self.job and progress.get('event')=='error': state='未完成：'+progress.get('message','查看日志')
             pending = item.get('pending_records')
             line = (f'{"*" if item.get("serial") in self.marked else " "}  {kind:<4} {serial:<18} '
                     f'{"附近" if item.get("nearby") else "—":<4} '
@@ -565,7 +665,7 @@ class Terminal:
         for number, line in enumerate(list(self.logs)[-max(1, height - log_start - 3):]):
             self.put(log_start + number, line, curses.A_DIM)
         self.put(height - 2, '↑↓ 选择  空格勾选  a 批量  Enter/d 下载  s 扫描  x 读编号  v 记录  e 导出')
-        self.put(height - 1, 'a 全部  b 备份  m 迁移  p 位置  o 文件夹  c 取消  l 日志  ? 帮助  q 退出', curses.A_DIM)
+        self.put(height - 1, f'g 设备配置  j 并发({self.parallel})  b 备份  m 迁移  p 位置  c 取消  ? 帮助  q 退出', curses.A_DIM)
         if self.preview is not None:
             self.screen.erase()
             self.put(0, '最近 100 条记录 · ↑↓ 滚动 · Esc/q 返回 · 时间为设备本地时间', curses.A_BOLD)
@@ -581,6 +681,33 @@ class Terminal:
             self.put(0, '帮助 / 任务日志 · ↑↓ / PgUp / PgDn 滚动 · Esc/q 返回', curses.A_BOLD)
             for index, line in enumerate(self.text_view[self.text_offset:self.text_offset + height - 3]):
                 self.put(index + 2, line)
+        if self.device_state is not None:
+            self.screen.erase()
+            state=self.device_state;settings=state.get('settings') or {}
+            self.put(0,f'设备 {state.get("serial")} · {state.get("model", "")} · 配置 / 实时测量',curses.A_BOLD)
+            wrap_label='设备未提供' if settings.get('wrap') is None else '开启' if settings.get('wrap') else '关闭'
+            battery='未读到' if state.get('battery_pct') is None else str(state['battery_pct'])+'%（设备报告）'
+            lines=[f'名称：{state.get("name") or "默认名称"}   电量：{battery}',
+                f'固件：{state.get("firmware")}   硬件：{state.get("hardware")}',
+                f'设备当前时间：{state.get("device_time")}（不会自动校时）',
+                f'1 采样间隔：{settings.get("interval_seconds")} 秒',
+                f'2 滚动覆盖：{wrap_label}（关闭时满后停止记录）',
+                '3 校准设备时间（保留原始历史时间）',
+                '4 修改设备名称',f'5 实时更新间隔：{settings.get("update_seconds")} 秒',
+                f'6 气压参考海拔：{settings.get("reference_altitude_m")} 米',
+                'r 重新读取   w 读取实时测量   b 闪灯定位',
+                self.message]
+            if state.get('live'):
+                readings=state['live']['measurements']
+                entries=[(key,label,unit) for key,label,unit in [('temperature_c','温度','°C'),('relative_humidity_pct','湿度','%'),('heat_index_c','热指数','°C'),('dew_point_c','露点','°C'),('station_pressure_hpa','气压','hPa'),('density_altitude_m','密度高度','m')]]
+                for offset in range(0,len(entries),2):
+                    parts=[]
+                    for key,label,unit in entries[offset:offset+2]:
+                        value=readings.get(key);parts.append(f'{label}：{value if value is not None else "--"} {unit}')
+                    lines.append('    '.join(parts))
+            if state.get('read_errors'):lines.append('部分字段未读到：'+str(state['read_errors']))
+            for row,line in enumerate(lines,2): self.put(row,line)
+            self.put(height-1,'Enter / Esc 返回设备列表；配置写入后逐项回读，失败不自动重试',curses.A_DIM)
         if self.form:
             self.screen.erase()
             self.put(1, self.form['title'], curses.A_BOLD)
@@ -610,7 +737,7 @@ class Terminal:
                 self.put(row, f'本次新增 {item.get("added_records", 0):,} 条 · 累计 {item.get("total_records", 0):,} 条 · 未确认 {item.get("pending_records", 0):,} 条')
                 row += 1
                 if len(view['outcomes']) == 1:
-                    self.put(row, f'时间范围：{item.get("first_timestamp") or "—"} 至 {item.get("last_timestamp") or "—"}')
+                    self.put(row, f'首末记录时间：{item.get("first_timestamp") or "—"} / {item.get("last_timestamp") or "—"}')
                     row += 2
             if row >= height - 10:
                 break
@@ -643,6 +770,7 @@ class Terminal:
         try:
             while True:
                 self.poll()
+                self.refresh_if_changed()
                 if self.quit_after_cancel and self.job is None:
                     return 0
                 self.draw()

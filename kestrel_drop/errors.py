@@ -1,7 +1,7 @@
 """Actionable failures shared by transport, CLI and terminal UI."""
 import sqlite3
 
-TITLES = {'operation_failed': '操作未完成', 'transfer_integrity': '传输校验未通过',
+TITLES = {'configuration_unknown':'配置结果需要回读核对', 'operation_failed': '操作未完成', 'transfer_integrity': '传输校验未通过',
           'device_mismatch': '连接的设备与选择不符', 'bluetooth_unavailable': '蓝牙连接不可用',
           'cancelled': '任务已取消', 'already_exists': '目标文件或档案已经存在',
           'not_found': '未找到文件或设备档案', 'invalid_input': '输入内容需要检查',
@@ -25,6 +25,11 @@ class TransferError(AppError):
     code = 'transfer_integrity'
     retryable = True
     action = '已保存的连续边界保留。可重试下载；若反复出现，请保留日志检查设备。'
+
+
+class ConfigurationFailure(AppError):
+    code = 'configuration_unknown'
+    action = '配置可能已部分生效；请先读取设备当前设置并检查审计记录，不要直接重复写入。'
 
 
 class DeviceMismatch(AppError):
