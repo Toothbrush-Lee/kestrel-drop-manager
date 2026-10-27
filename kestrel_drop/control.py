@@ -109,8 +109,9 @@ def settings_payload(raw, changes):
     return bytes(payload)
 
 
-async def inspect(client):
+async def inspect(client, *, stable=None, clock_read=None):
     from bleak.exc import BleakError
+    stable = stable or {}
     result, errors = {}, {}
     fields = [('settings', SETTINGS_UUID, decode_settings),
               ('name', NAME_UUID, lambda b: b.rstrip(b'\0').decode('ascii')),
@@ -118,6 +119,9 @@ async def inspect(client):
               ('firmware', FIRMWARE_UUID, lambda b: b.rstrip(b'\0').decode('ascii')),
               ('hardware', HARDWARE_UUID, lambda b: b.rstrip(b'\0').decode('ascii'))]
     for name, characteristic, decode in fields:
+        if name in ('firmware','hardware') and stable.get(name) is not None and name not in stable.get('read_errors',{}):
+            result[name] = stable[name]
+            continue
         try:
             import asyncio
             raw = bytes(await asyncio.wait_for(client.read_gatt_char(characteristic), 15))
@@ -127,7 +131,7 @@ async def inspect(client):
             errors[name] = str(exc)
             result[name] = None
     try:
-        result['device_time'],result['device_time_wire_hex']=await clock(client)
+        result['device_time'],result['device_time_wire_hex']=clock_read if clock_read is not None else await clock(client)
         result['device_time_source']='link_command_14'
     except (BleakError, ValueError, TransferError, TimeoutError) as exc:
         result['device_time']=None;errors['device_time']=str(exc)
@@ -155,12 +159,15 @@ async def apply(client, changes, before):
         await write(NAME_UUID, changes['name'].encode('ascii').ljust(20, b'\0'))
         actual = bytes(await asyncio.wait_for(client.read_gatt_char(NAME_UUID), 15)).rstrip(b'\0').decode('ascii')
         if actual != changes['name']: raise TransferError('设备名称写入后回读不一致')
+    clock_read = None
     if 'time' in changes:
         value = datetime.now().astimezone().replace(tzinfo=None, microsecond=0).isoformat(sep=' ') if changes['time']=='now' else changes['time']
-        actual,_ = await clock(client,value)
+        clock_read = await clock(client,value)
+        actual,_ = clock_read
         delta = (datetime.fromisoformat(actual)-datetime.fromisoformat(value)).total_seconds()
         if not 0 <= delta <= 10: raise TransferError('设备时间写入后回读偏差过大，请重新读取')
-    after = await inspect(client)
+    # Reuse only stable fields and the clock read already verified on this connection.
+    after = await inspect(client, stable=before, clock_read=clock_read)
     if 'time' in changes: after['time_write_target_local'] = value
     return after
 

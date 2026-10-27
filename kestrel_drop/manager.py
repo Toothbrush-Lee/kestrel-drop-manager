@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import csv
 from datetime import datetime, timedelta
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, closing
 from contextvars import ContextVar
 import os
 from pathlib import Path
@@ -84,12 +84,12 @@ class Library:
             return {}
         return {d['serial']: self.database_path for d in self.store.status() if d['database_records']}
 
-    def status(self):
+    def status(self, serial=None):
         if not self.database_path.exists():
             if legacy_archives(self.root):
                 raise MigrationRequired('发现旧 CSV 档案，请先运行 migrate 完成迁移')
             return []
-        return self.store.status()
+        return self.store.status(serial)
 
     def targets(self):
         return [item['serial'] for item in self.status()]
@@ -124,7 +124,7 @@ class Library:
         return self.database_path
 
     def complete_download(self, serial, previous=0, code=0):
-        info = next((d for d in self.status() if d['serial'] == serial), None)
+        info = next(iter(self.status(serial)), None)
         if info and info.get('error'):
             raise RuntimeError(info['error'])
         total = info['committed_records'] if info else 0
@@ -177,7 +177,7 @@ class Library:
                     events.emit('phase', serial=serial, phase='querying')
                     count = await session.query_count(cursor)
                     if not count:
-                        return 3 if pending or any(d['serial'] == serial and d['pending_records'] for d in store.status()) else 0
+                        return 3 if pending or any(d['serial'] == serial and d['pending_records'] for d in store.status(serial)) else 0
                     if count > maxrows:
                         raise RuntimeError('设备报告的记录数超过 --maxrows；可能存在历史缺口，未继续读取')
                     transfer_id = store.begin_transfer(serial, cursor, count)
@@ -214,17 +214,24 @@ class Library:
             changes = control.validate_changes(changes)
             if not execute: return {'serial':serial,'status':'dry_run','changes':changes,'note':'未访问蓝牙；--execute 后逐项写入并回读验证'}
         if blink and not execute: return {'serial':serial,'status':'dry_run','action':'blink','note':'--execute 后闪灯定位'}
+        timings = {}
+        started = time.monotonic()
         # One directory owner prevents simultaneous download/configuration of a device.
         owner = _collection.get()
         with nullcontext() if owner is not None and owner[0] is self else writer_lock(self.root):
             device = await devices.resolve(SimpleNamespace(serial=serial,ble_id=ble_id,scan_timeout=timeout))
+            timings['locating'] = time.monotonic() - started
             from bleak import BleakClient
             events.emit('phase',serial=serial,phase='connecting')
             async def connected():
+                connection_started = time.monotonic()
                 async with BleakClient(device,timeout=30) as client:
+                    timings['connecting'] = time.monotonic() - connection_started
+                    identity_started = time.monotonic()
                     events.emit('phase',serial=serial,phase='identifying')
                     identity = await devices.read_identity(client,ble_id=device.address)
                     devices.require_identity(identity,expected=serial)
+                    timings['identity'] = time.monotonic() - identity_started
                     if changes and 'reference_altitude_m' in changes and identity['device_type']!='D3':
                         raise ValueError('参考海拔用于 D3 气压计算，此型号不适用；未发送设置指令')
                     if samples:
@@ -234,25 +241,36 @@ class Library:
                             events.emit('sample',**sample);values.append(sample)
                             if index+1 < samples: await asyncio.sleep(period)
                         return {'serial':serial,'samples':values,'stored':False}
+                    read_started = time.monotonic()
                     before=await control.inspect(client)
+                    timings['read_before'] = time.monotonic() - read_started
                     result={**identity,**before}
                     if changes is None and not blink: return result
+                    audit_started = time.monotonic()
                     store=self._writable_store()
                     store.register_device(serial,identity['model'])
                     action=store.begin_action(serial,changes or {'blink':True},result)
+                    timings['audit'] = time.monotonic() - audit_started
+                    write_started = time.monotonic()
                     try:
                         if blink:
                             payload=bytearray(20);payload[1]=1
                             await asyncio.wait_for(client.write_gatt_char(control.COMMANDS_UUID,bytes(payload),response=True),15)
                             after={'command_acknowledged':True,'visual_confirmation_required':True}
                         else: after=await control.apply(client,changes,before)
+                        timings['write_verify'] = time.monotonic() - write_started
+                        audit_started = time.monotonic()
                         store.finish_action(action,after=after)
+                        timings['audit'] += time.monotonic() - audit_started
                         return {'serial':serial,'status':'verified','action_id':action,'before':result,'after':after}
                     except BaseException as exc:
                         store.finish_action(action,error=f'{type(exc).__name__}: {exc}; device may have changed; read back before retry')
                         if isinstance(exc, asyncio.CancelledError): raise
                         raise ConfigurationFailure(str(exc)) from exc
-            return await _ble_call(connected)
+            result = await _ble_call(connected)
+            timings['total'] = time.monotonic() - started
+            result['timings_seconds'] = timings
+            return result
 
     @contextmanager
     def collection(self, execute, *, parallel=1):
@@ -277,7 +295,7 @@ class Library:
         if start and end and start > end: raise ValueError('开始时间不能晚于结束时间')
         end_exclusive = bool(until and re.fullmatch(r'\d{4}-\d{2}-\d{2}', until))
         if end_exclusive: end += timedelta(days=1)
-        selected = self.query_store(serial).query(serial_number(serial), since=start.isoformat(sep=' ') if start else None,
+        selected = self.query_store(serial).iter_query(serial_number(serial), since=start.isoformat(sep=' ') if start else None,
             until=end.isoformat(sep=' ') if end else None, end_exclusive=end_exclusive)
         names = ['serial', 'history_generation', 'absolute_cursor', 'device_sequence', *FIELDS]
         destination = Path(destination).expanduser().resolve()
@@ -286,15 +304,19 @@ class Library:
         fd, temporary = tempfile.mkstemp(prefix='.kestrel-export-', suffix='.csv', dir=destination.parent)
         temporary = Path(temporary)
         try:
-            with os.fdopen(fd, 'w', newline='', encoding='utf-8-sig') as stream:
+            count = 0
+            with os.fdopen(fd, 'w', newline='', encoding='utf-8-sig') as stream, closing(selected):
                 writer = csv.DictWriter(stream, fieldnames=names)
-                writer.writeheader(); writer.writerows(selected)
+                writer.writeheader()
+                for row in selected:
+                    writer.writerow(row)
+                    count += 1
                 stream.flush(); os.fsync(stream.fileno())
             os.link(temporary, destination)
             protocol._fsync_directory(destination.parent)
         finally:
             temporary.unlink(missing_ok=True)
-        return len(selected)
+        return count
 
 
 def parser():
@@ -499,7 +521,8 @@ def _run(args):
                 snapshot, scan_error = None, None
                 if args.execute and len(serials) > 1:
                     try:
-                        snapshot = await devices.scan_snapshot(args.timeout)
+                        snapshot = await devices.scan_snapshot(args.timeout,
+                            addresses=list(targets.values()) if all(targets.values()) else None)
                     except (OSError, RuntimeError, ValueError) as exc:
                         scan_error = exc
                 semaphore=asyncio.Semaphore(args.parallel)

@@ -56,7 +56,7 @@ async def configure(library, selected, changes, *, execute=False, timeout=20):
                                                            changes=changes, execute=execute)
                 if execute:
                     publish({'serial': serial, 'status': 'verified', 'changes': changes,
-                             'action_id': value['action_id'],
+                             'action_id': value['action_id'], 'timings_seconds': value.get('timings_seconds', {}),
                              'time_write_target_local': value['after'].get('time_write_target_local')})
                 else:
                     publish({'serial': serial, 'status': 'dry_run', 'changes': changes})

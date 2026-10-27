@@ -335,11 +335,16 @@ class Store:
             stats = connection.execute('SELECT count(*), (SELECT timestamp_device_local FROM observations WHERE history_id=? ORDER BY absolute_cursor LIMIT 1), (SELECT timestamp_device_local FROM observations WHERE history_id=? ORDER BY absolute_cursor DESC LIMIT 1) FROM observations WHERE history_id=?', (history['id'], history['id'], history['id'])).fetchone()
             return {**dict(identity), **dict(history), 'row_count': stats[0], 'first_timestamp': stats[1], 'last_timestamp': stats[2]}
 
-    def status(self):
+    def status(self, serial=None):
         result = []
         with self.connect() as connection:
             connection.execute('BEGIN')
-            histories = connection.execute('SELECT h.*, d.model FROM histories h JOIN devices d USING(serial) ORDER BY serial,generation').fetchall()
+            statement = 'SELECT h.*, d.model FROM histories h JOIN devices d USING(serial)'
+            values = ()
+            if serial is not None:
+                statement += ' WHERE h.serial=?'
+                values = (serial_number(serial),)
+            histories = connection.execute(statement + ' ORDER BY serial,generation', values).fetchall()
             for h in histories:
                 count, earliest, latest = connection.execute('SELECT count(*),(SELECT timestamp_device_local FROM observations WHERE history_id=? ORDER BY absolute_cursor LIMIT 1),(SELECT timestamp_device_local FROM observations WHERE history_id=? ORDER BY absolute_cursor DESC LIMIT 1) FROM observations WHERE history_id=?', (h['id'], h['id'], h['id'])).fetchone()
                 item = {'serial': h['serial'], 'model': h['model'], 'history_id': h['id'],
@@ -362,8 +367,9 @@ class Store:
                 result.append(item)
         return result
 
-    def query(self, serial, *, limit=None, since=None, until=None, end_exclusive=False):
-        conditions, values = ['h.serial=?'], [serial]
+    @contextmanager
+    def _query_cursor(self, serial, *, limit=None, since=None, until=None, end_exclusive=False):
+        conditions, values = ['h.serial=?'], [serial_number(serial)]
         if since:
             conditions.append('o.timestamp_device_local>=?'); values.append(since)
         if until:
@@ -372,13 +378,30 @@ class Store:
         sql += ' ORDER BY h.generation ' + ('DESC' if limit else 'ASC') + ',absolute_cursor ' + ('DESC' if limit else 'ASC')
         if limit:
             sql += ' LIMIT ?'; values.append(limit)
-        self.device(serial)
         with self.connect() as connection:
-            records = connection.execute(sql, values).fetchall()
-        if limit:
-            records.reverse()
-        return [dict(serial=serial, history_generation=r['generation'], absolute_cursor=r['absolute_cursor'], device_sequence=r['absolute_cursor']+1,
-                     **{k: r[k] for k in FIELDS if k != 'record_hex'}, record_hex=r['record_raw'].hex()) for r in records]
+            connection.execute('BEGIN')
+            self._history(connection, serial)
+            yield connection.execute(sql, values)
+
+    @staticmethod
+    def _record(serial, row):
+        return dict(serial=serial, history_generation=row['generation'], absolute_cursor=row['absolute_cursor'],
+                    device_sequence=row['absolute_cursor']+1,
+                    **{key: row[key] for key in FIELDS if key != 'record_hex'}, record_hex=row['record_raw'].hex())
+
+    def iter_query(self, serial, *, since=None, until=None, end_exclusive=False):
+        """Stream one stable read snapshot; callers may close early on cancellation."""
+        with self._query_cursor(serial, since=since, until=until, end_exclusive=end_exclusive) as cursor:
+            while batch := cursor.fetchmany(1000):
+                for row in batch:
+                    yield self._record(serial, row)
+
+    def query(self, serial, *, limit=None, since=None, until=None, end_exclusive=False):
+        if not limit:
+            return list(self.iter_query(serial, since=since, until=until, end_exclusive=end_exclusive))
+        with self._query_cursor(serial, limit=limit, since=since, until=until, end_exclusive=end_exclusive) as cursor:
+            records = cursor.fetchall()
+        return [self._record(serial, row) for row in reversed(records)]
 
     def check(self):
         with self.connect() as connection:

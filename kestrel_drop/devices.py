@@ -68,8 +68,10 @@ async def ble_call(operation, *args, **kwargs):
         raise BluetoothFailure(f'蓝牙操作失败：{exc}。请断开手机 LiNK，检查蓝牙开关和终端权限，然后重试。') from exc
 
 
-async def scan_snapshot(timeout=15):
+async def scan_snapshot(timeout=15, *, addresses=None):
     if timeout <= 0: raise ValueError('扫描时间必须大于 0')
+    if addresses is not None:
+        return await locate_snapshot(addresses, timeout)
     from bleak import BleakScanner
     events.emit('phase', phase='scanning')
     return await ble_call(BleakScanner.discover, timeout=timeout, return_adv=True)
@@ -91,19 +93,24 @@ def candidates(found):
     return sorted(result, key=lambda r: r['rssi'] if r['rssi'] is not None else -999, reverse=True)
 
 
-async def locate_snapshot(address, timeout):
-    """Stop at the requested address; retain observations for stale-address fallback.
+async def locate_snapshot(addresses, timeout):
+    """Stop when all requested addresses arrive; retain stale-address fallback hints.
 
     BLEDevice includes native backend state and cannot be reconstructed from a
     JSON scan result in another worker. Reacquire it without a full timed scan.
     """
     from bleak import BleakScanner
     observed = {}
-    target = address.casefold()
+    if isinstance(addresses, str):
+        addresses = [addresses]
+    pending = {address.strip().casefold() for address in addresses}
+    if not pending or '' in pending:
+        raise ValueError('目标地址不能为空')
 
     def match(device, adv):
         observed[device.address.casefold()] = (device, adv)
-        return device.address.casefold() == target
+        pending.discard(device.address.casefold())
+        return not pending
 
     events.emit('phase', phase='locating')
     await ble_call(BleakScanner.find_device_by_filter, match, timeout=timeout)

@@ -102,6 +102,7 @@ def scenario(library):
         export_index += 1
         library.export(serial, library.root / 'exports' / f'test-{export_index}.csv')
     output['export_one_device'] = measure(export, repeats=3)
+    output['export_peak_python_mib'] = python_peak(export)
     output['cli_list_process'] = measure(lambda: subprocess.run(
         [sys.executable, '-B', str(ROOT / 'kestrel.py'), '--data-dir', str(library.root), 'list'],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE), repeats=3)
@@ -123,7 +124,10 @@ def interface(path):
     result = {'dashboard_100_devices': measure(terminal.draw, repeats=20)}
     for size in (100, 1000):
         terminal.text_view = [('设备日志 / ' + '中A' * size)[:size] for _ in range(500)]
-        result[f'log_500_lines_x_{size}_characters'] = measure(terminal.draw, repeats=10)
+        started = time.perf_counter()
+        terminal.draw()
+        first_layout_ms = (time.perf_counter() - started) * 1000
+        result[f'log_500_lines_x_{size}_characters'] = {**measure(terminal.draw, repeats=10), 'first_layout_ms': first_layout_ms}
     result['long_log_profile'] = profile_text(terminal.draw)
     return result
 

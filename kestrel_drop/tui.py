@@ -22,7 +22,7 @@ from .worker import Job
 from .ui_text import clip, text_width, wrap_lines, input_window
 from .ui_actions import format_interval, setting_change, retry_download_arguments, selected_devices, batch_setting_change
 
-PHASES = {'scanning': '扫描附近设备', 'locating': '定位已知设备（发现即连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
+PHASES = {'scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
           'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
           'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库'}
 STATUSES = {'downloaded': '已保存', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
@@ -88,6 +88,9 @@ class Terminal:
         self.refresh_message = None
         self.text_view = None
         self.text_offset = 0
+        self._wrapped_cache_key = None
+        self._wrapped_cache = []
+        self.needs_redraw = True
         self.result_view = None
         self.device_state = None
         self.review = None
@@ -115,6 +118,7 @@ class Terminal:
             self.start('list',['list'])
 
     def start(self, action, arguments):
+        self.needs_redraw = True
         if self.job:
             self.message = '任务执行中；按 c 取消，或等待完成'
             return False
@@ -142,6 +146,7 @@ class Terminal:
                 kind, value = self.job.events.get_nowait()
             except queue.Empty:
                 return
+            self.needs_redraw = True
             if kind == 'event':
                 self.receive_event(value)
                 continue
@@ -235,6 +240,7 @@ class Terminal:
             return
 
     def receive_event(self, event):
+        self.needs_redraw = True
         kind = event['event']
         if event.get('serial') and kind in ('phase','progress','completed','configured','error'):
             self.device_progress.setdefault(event['serial'],{}).update(event)
@@ -378,7 +384,11 @@ class Terminal:
 
     def wrapped_text(self):
         width=max(1,self.screen.getmaxyx()[1]-3)
-        return [line for source in self.text_view or [] for line in wrap_lines(source,width)]
+        key = (width, tuple(self.text_view or []))
+        if key != self._wrapped_cache_key:
+            self._wrapped_cache = [line for source in key[1] for line in wrap_lines(source,width)]
+            self._wrapped_cache_key = key
+        return self._wrapped_cache
 
     def handle_result(self, key):
         view=self.result_view
@@ -411,6 +421,7 @@ class Terminal:
         return True
 
     def handle(self, key):
+        self.needs_redraw = True
         if self.job and key=='c':
             self.job.cancel()
             self.message='正在取消；配置可能部分生效，请在取消后重新读取' if self.action in ('set','blink','set-batch') else '正在取消，等待连接清理'
@@ -433,7 +444,10 @@ class Terminal:
         if self.text_view is not None:
             total=len(self.wrapped_text())
             step=max(1,self.screen.getmaxyx()[0]-4)
-            if key in ('q','\x1b','\n','\r'): self.text_view=None
+            if key in ('q','\x1b','\n','\r'):
+                self.text_view=None
+                self._wrapped_cache_key=None
+                self._wrapped_cache=[]
             elif key in (curses.KEY_DOWN,curses.KEY_NPAGE): self.text_offset=min(max(0,total-1),self.text_offset+(step if key==curses.KEY_NPAGE else 1))
             elif key in (curses.KEY_UP,curses.KEY_PPAGE): self.text_offset=max(0,self.text_offset-(step if key==curses.KEY_PPAGE else 1))
             elif key==curses.KEY_HOME:self.text_offset=0
@@ -649,7 +663,17 @@ class Terminal:
         except curses.error:
             pass
 
+    def active_drawer(self):
+        for state, drawer in ((self.review,self.draw_review), (self.form,self.draw_form),
+                              (self.text_view,self.draw_text), (self.result_view,self.draw_result),
+                              (self.preview,self.draw_preview), (self.batch_settings,self.draw_batch_settings),
+                              (self.device_state,self.draw_device)):
+            if state is not None:
+                return drawer
+        return self.draw_dashboard
+
     def draw(self):
+        self.needs_redraw = False
         self.screen.erase()
         height,width=self.screen.getmaxyx()
         if width<68 or height<18:
@@ -657,15 +681,8 @@ class Terminal:
             self.put(2,'c 取消任务；q 返回 / 退出；扩大窗口后会恢复当前页面')
             self.screen.refresh()
             return
-        self.draw_dashboard(height,width)
-        # Overlay order is also the keyboard priority: the topmost page owns input.
-        if self.device_state is not None: self.draw_device(height,width)
-        if self.batch_settings is not None:self.draw_batch_settings(height,width)
-        if self.preview is not None: self.draw_preview(height,width)
-        if self.result_view is not None: self.draw_result(height,width)
-        if self.text_view is not None: self.draw_text(height,width)
-        if self.form is not None: self.draw_form(height,width)
-        if self.review is not None: self.draw_review(height,width)
+        # Draw only the opaque top page; keyboard routing uses the same priority.
+        self.active_drawer()(height,width)
         try: curses.curs_set(1 if self.form is not None and self.review is None else 0)
         except curses.error: pass
         self.screen.refresh()
@@ -869,13 +886,24 @@ class Terminal:
         except curses.error:
             pass
         self.start('list', ['list'])
+        previous_size = None
+        next_animation = 0
         try:
             while True:
                 self.poll()
                 self.refresh_if_changed()
                 if self.quit_after_cancel and self.job is None:
                     return 0
-                self.draw()
+                size = self.screen.getmaxyx()
+                if size != previous_size:
+                    self.needs_redraw = True
+                    previous_size = size
+                now = time.monotonic()
+                if self.job and self.active_drawer() == self.draw_dashboard and now >= next_animation:
+                    self.needs_redraw = True
+                    next_animation = now + 0.25
+                if self.needs_redraw:
+                    self.draw()
                 try:
                     key = self.screen.get_wch()
                 except curses.error:
