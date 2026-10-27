@@ -1,8 +1,22 @@
 # Kestrel DROP 电脑下载管理
 
-扫描设备、批量下载 D1/D2/D3 历史，统一保存在电脑的 SQLite 档案库，按需导出 Excel 可打开的 CSV。当前版本 **0.11.0**，面向日常采集与多设备管理。
+扫描设备、批量下载 D1/D2/D3 历史，统一保存在电脑的 SQLite 档案库，按需导出 Excel 可打开的 CSV。当前版本 **0.11.1**，面向日常采集与多设备管理。
 
 ## 快速开始
+
+**普通用户推荐下载 [GitHub Releases](https://github.com/Toothbrush-Lee/kestrel-drop-manager/releases) 中的独立运行包**（私有仓库需登录获授权的 GitHub 账号）：
+
+| 电脑 | 下载文件 | 启动 |
+| --- | --- | --- |
+| Apple Silicon Mac（M 系列） | macos-arm64.zip | 解压，双击 Kestrel.command |
+| Intel Mac | macos-x86_64.zip | 解压，双击 Kestrel.command |
+| Linux x86_64 | linux-x86_64.tar.gz | 解压，在终端运行 ./start.sh |
+
+独立运行包不需要 Python 或 uv；请保留整个解压文件夹。Mac 包尚未做 Apple Developer ID 签名和公证，首次打开可能需要在系统设置“隐私与安全性”中允许打开；首次连接需允许蓝牙权限。CI 在 macOS 15 和 Ubuntu 22.04 验证启动，其他系统版本需要另行实测。Windows 暂不支持。
+
+升级只替换程序文件夹，数据仍留在原数据目录。原源码安装使用 archive/ 的用户，应先在原程序按 p 保存数据目录的**绝对路径**，再启动新版，避免显示成空档案；程序不会自动搬迁数据。
+
+**从源码运行**：
 
 需要 macOS / Linux、Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)。macOS 可双击 `Kestrel.command`，也可以在本项目目录运行：
 
@@ -52,3 +66,5 @@ uv run --locked python -B tests/run.py
 ```
 
 测试入口使用临时默认档案和配置，不触碰工作中的观测数据。硬件功能和固件差异的实测边界见验收记录。
+
+自动构建、发布及版本维护说明见 [docs/releasing.md](docs/releasing.md)。

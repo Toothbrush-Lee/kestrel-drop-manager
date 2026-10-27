@@ -1,0 +1,69 @@
+name: CI
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-22.04, python: '3.11'}
+          - {os: ubuntu-22.04, python: '3.14'}
+          - {os: macos-15, python: '3.14'}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: '0.13.5'
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run --locked python -B scripts/check_release.py version
+      - run: uv run --locked python -B tests/run.py -q
+
+  package:
+    name: Python packages and installed TUI
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: '0.13.5'
+          python-version: '3.14'
+          enable-cache: true
+      - run: uv sync --locked --group build
+      - name: Build and audit wheel and source distribution
+        run: |
+          uv build --no-build-isolation --out-dir "$RUNNER_TEMP/python-dist"
+          uv run --locked python -B scripts/check_release.py audit "$RUNNER_TEMP/python-dist"
+      - name: Install wheel away from checkout and test CLI and TUI
+        run: |
+          uv venv --python 3.14 "$RUNNER_TEMP/wheel-venv"
+          uv export --locked --no-dev --no-emit-project --no-hashes --output-file "$RUNNER_TEMP/runtime.txt"
+          uv pip install --python "$RUNNER_TEMP/wheel-venv/bin/python" --constraint "$RUNNER_TEMP/runtime.txt" "$RUNNER_TEMP"/python-dist/*.whl
+          uv run --locked python -B scripts/smoke_install.py --python "$RUNNER_TEMP/wheel-venv/bin/python"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-dist
+          path: ${{ runner.temp }}/python-dist/*
+          if-no-files-found: error
+          retention-days: 7

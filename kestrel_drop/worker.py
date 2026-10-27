@@ -67,6 +67,15 @@ def validate_result(action, data):
     return data
 
 
+def cli_command(arguments):
+    """Use the same CLI for checkout, installed wheel and frozen executable."""
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, *arguments]
+    launcher = Path(__file__).resolve().parents[1] / 'kestrel.py'
+    prefix = [sys.executable, '-u', str(launcher)] if launcher.is_file() else [sys.executable, '-u', '-m', 'kestrel_drop']
+    return [*prefix, *arguments]
+
+
 class Job:
     def __init__(self, root, arguments):
         self.events = queue.Queue()
@@ -78,8 +87,7 @@ class Job:
         self.protocol_error = False
         self.finished = False
         self.process = subprocess.Popen(
-            [sys.executable, '-u', str(Path(__file__).resolve().parents[1] / 'kestrel.py'),
-             '--data-dir', str(root), '--events-json', *arguments],
+            cli_command(['--data-dir', str(root), '--events-json', *arguments]),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding='utf-8', errors='replace', bufsize=1,
             env={**os.environ, 'PYTHONUNBUFFERED': '1'},

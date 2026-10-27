@@ -22,3 +22,8 @@ __pycache__/
 
 # Vendor-provided protocol documents stay local.
 /KestrelDocuments/
+
+# Reproducible build outputs.
+/build/
+/dist/
+*.egg-info/
