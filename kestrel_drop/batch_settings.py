@@ -31,13 +31,15 @@ def targets(serials, addresses=None):
     return result
 
 
-async def configure(library, selected, changes, *, execute=False, timeout=20):
+async def configure(library, selected, changes, *, execute=False, timeout=20, allow_schedule_shift=False):
     changes = control.validate_changes(changes)
     if set(changes) - FIELDS:
         raise ValueError('批量设置仅支持采样间隔、滚动覆盖、实时更新间隔和时间')
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError('设备查询超时必须为正数')
     selected = targets(list(selected), list(selected.values()))
+    if execute and 'time' in changes and allow_schedule_shift is not True:
+        raise ValueError('批量校时可能改变各台采样相位；确认风险后使用 --allow-schedule-shift')
     outcomes, failures = [], []
 
     def publish(outcome):
@@ -53,13 +55,15 @@ async def configure(library, selected, changes, *, execute=False, timeout=20):
             try:
                 with events.context(serial=serial):
                     value = await library.device_operation(serial, ble_id=address, timeout=timeout,
-                                                           changes=changes, execute=execute)
+                                                           changes=changes, execute=execute,allow_schedule_shift=allow_schedule_shift)
                 if execute:
                     publish({'serial': serial, 'status': 'verified', 'changes': changes,
                              'action_id': value['action_id'], 'timings_seconds': value.get('timings_seconds', {}),
-                             'time_write_target_local': value['after'].get('time_write_target_local')})
+                             'time_write_target_local': value['after'].get('time_write_target_local'),
+                             'sampling_risk':value['after'].get('sampling_risk'),
+                             'time_write_skipped':value['after'].get('time_write_skipped')})
                 else:
-                    publish({'serial': serial, 'status': 'dry_run', 'changes': changes})
+                    publish({'serial': serial, 'status': 'dry_run', 'changes': changes,'sampling_risk':control.clock_risk(changes)})
             except (asyncio.CancelledError, KeyboardInterrupt):
                 failure = {'serial': serial, 'code': 'configuration_cancelled',
                            'message': '本台配置取消，可能部分生效。',

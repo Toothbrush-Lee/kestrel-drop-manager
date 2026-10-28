@@ -54,7 +54,14 @@ class FakeControl:
                     return
                 if owner.audit_check:owner.audit_check()
                 owner.writes.append((uuid,bytes(payload)))
-                if not owner.reject: owner.values[uuid]=bytes(payload)
+                if not owner.reject:
+                    if uuid==control.SETTINGS_UUID:
+                        actual=bytearray(owner.values[uuid])
+                        for start,end,ignore in ((0,3,b'\xff'*3),(3,4,b'\xff'),(4,5,b'\xff'),(5,6,b'\xff'),(6,7,b'\xff'),(7,9,b'\x01\x80')):
+                            if payload[start:end]!=ignore:actual[start:end]=payload[start:end]
+                        actual[9:]=payload[9:]
+                        owner.values[uuid]=bytes(actual)
+                    else:owner.values[uuid]=bytes(payload)
                 if owner.fail_after and len(owner.writes)>=owner.fail_after: raise OSError('lost response after write')
         self.client=Client()
         self.module=ModuleType('bleak');self.module.BleakClient=Client
@@ -72,12 +79,12 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         before=await control.inspect(fake.client)
         original=bytes.fromhex(before['settings_raw_hex'])
         changes={'interval_seconds':600,'wrap':False,'update_seconds':20,'reference_altitude_m':-10,'name':'Field-A','time':'2026-10-26 12:15:00'}
-        after=await control.apply(fake.client,changes,before)
+        after=await control.apply(fake.client,changes,before,allow_schedule_shift=True)
         self.assertEqual(after['settings']['interval_seconds'],600)
         self.assertFalse(after['settings']['wrap'])
         self.assertEqual(after['settings']['reference_altitude_m'],-10)
         payload=fake.writes[0][1]
-        self.assertEqual(payload[5:7],original[5:7]);self.assertEqual(payload[9:],original[9:])
+        self.assertEqual(payload[5:7],b'\xff\xff');self.assertEqual(payload[9:],original[9:])
         self.assertEqual(after['name'],'Field-A');self.assertEqual(after['device_time'],changes['time'])
 
     async def test_live_status_and_official_gatt_scaling(self):
@@ -332,7 +339,7 @@ class ProtocolEdgeTests(unittest.IsolatedAsyncioTestCase):
         fake=FakeControl()
         with fake.patches():
             before=await control.inspect(fake.client)
-            after=await control.apply(fake.client,{'time':value},before)
+            after=await control.apply(fake.client,{'time':value},before,allow_schedule_shift=True)
         self.assertEqual(after['device_time'],value)
         writes=[f for f in fake.mass_writes if f.kind==0 and f.payload[:2]==b'\x0f\0']
         self.assertEqual(len(writes),1);self.assertEqual(writes[0].payload[2:],wire)

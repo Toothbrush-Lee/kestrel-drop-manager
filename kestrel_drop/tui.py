@@ -158,7 +158,7 @@ class Terminal:
             self.action = None
             self.message = ('已取消；已落盘数据保留，可再次下载' if job.cancelled else
                             '操作完成' if value == 0 else f'操作未完成（退出码 {value}），请查看下方日志')
-            if (value == 0 or (action in ('list', 'scan') and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'blink', 'live'):
+            if (value == 0 or (action in ('list', 'scan') and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'blink', 'live', 'timing'):
                 try:
                     payload = job.payload
                     if payload is None:
@@ -188,7 +188,7 @@ class Terminal:
                         self.refresh_message = None
                     elif action in ('device','set'):
                         self.device_state = payload if action=='device' else {**payload['before'],**payload['after']}
-                        self.message = '设置已回读验证' if action=='set' else '设备信息已读取；不会自动校时'
+                        self.message = ('时钟已回读；采样相位未验证，按 t 诊断' if payload['after'].get('sampling_risk') else '设置已回读验证') if action=='set' else '设备信息已读取；不会自动校时'
                         self.device_state['read_stale']=False
                     elif action == 'blink':
                         self.message = '已发送闪灯定位，请观察设备 LED'
@@ -215,6 +215,10 @@ class Terminal:
                         self.devices = {}
                         self.marked.clear()
                         self.message = '数据位置已保存；已有数据未搬动'
+                    elif action == 'timing':
+                        from .timing import format_report
+                        self.text_view=format_report(payload);self.text_offset=0
+                        self.message='只读采样时间诊断完成；不会改写设备或历史'
                     elif action == 'export':
                         self.message = f'已导出 {payload["rows"]} 条：{payload["output"]}（按 l 查看完整路径）'
                     else:
@@ -296,6 +300,10 @@ class Terminal:
             elif action.startswith('set_'):
                 self.review=setting_change(action,values[0],self.device_state)
                 return
+            elif action == 'timing':
+                interval=int(values[0])
+                if not 2<=interval<=86400:raise ValueError('预期间隔须为2–86400秒')
+                if self.start('timing',['timing',self.form['target'],'--interval',str(interval)]) is False:return
             elif action == 'add':
                 from .manager import serial_number
                 serial = serial_number(values[0])
@@ -366,6 +374,7 @@ class Terminal:
             self.text_view=[
                 '快速开始：s 扫描 15 秒 → ↑↓ 选择 → Enter 下载 → e 导出。',
                 '已知地址按目标定位，发现即连接；默认扫描 15 秒。',
+                't 离线诊断采样间隔和整点相位；校时回读成功不代表整点采样。',
                 '首次读取最早仍保留的历史，以后只下载新增；设备中的旧记录不会自动删除。',
                 '编号未知：选择该行按 x 连接核验；已知编号仍会在下载前再次核对。',
                 '批量：空格勾选，A / Ctrl+A 全选附近可采集项，u 清空，Enter / a 下载所选。',
@@ -464,6 +473,14 @@ class Terminal:
             elif key in (curses.KEY_UP,curses.KEY_PPAGE): self.preview_offset=max(0,self.preview_offset-(max(1,self.screen.getmaxyx()[0]-5) if key==curses.KEY_PPAGE else 1))
             elif key==curses.KEY_HOME:self.preview_offset=0
             elif key==curses.KEY_END:self.preview_offset=max(0,len(self.preview)-max(1,self.screen.getmaxyx()[0]-5))
+            return True
+        if key=='t' and not self.job and self.batch_settings is None:
+            device=self.device_state or self.selected_device()
+            if not device or not device.get('serial'):self.message='请选择已有档案的设备'
+            else:
+                interval=(device.get('settings') or {}).get('interval_seconds') or 300
+                self.open_form('只读采样时间诊断（不会校时或改数据）',[('预期采样间隔（秒）',interval)],'timing')
+                self.form['target']=device['serial']
             return True
         if self.batch_settings is not None:
             if key in ('q','\x1b'): self.batch_settings=None
@@ -735,7 +752,7 @@ class Terminal:
         log_start=row+4
         for offset,line in enumerate(list(self.logs)[-max(1,height-log_start-3):]):self.put(log_start+offset,line,curses.A_DIM)
         self.put(height-2,'Enter 下载所选/当前  s 扫描  空格勾选  A 全选  a 下载所选  g 设置')
-        self.put(height-1,'Ctrl+A 全选附近  u 清空  j 并发  b 备份  l 日志  ? 帮助  q 退出',curses.A_DIM)
+        self.put(height-1,'t 时间诊断  u 清空  j 并发  b 备份  l 日志  ? 帮助  q 退出',curses.A_DIM)
 
     def draw_preview(self,height,width):
         self.screen.erase()
@@ -752,7 +769,7 @@ class Terminal:
 
     def draw_text(self,height,width):
         self.screen.erase()
-        self.put(0,'帮助 / 任务日志 · ↑↓ / PgUp / PgDn · Esc 返回上一层',curses.A_BOLD)
+        self.put(0,'帮助 / 任务日志 / 时间诊断 · ↑↓ / PgUp / PgDn · Esc 返回上一层',curses.A_BOLD)
         lines=self.wrapped_text()
         self.text_offset=min(self.text_offset,max(0,len(lines)-(height-4)))
         for row,line in enumerate(lines[self.text_offset:self.text_offset+height-4],2):self.put(row,line)
@@ -772,7 +789,7 @@ class Terminal:
                '3 校准设备时间（不改旧记录）   4 修改设备名称',
                f'5 实时更新间隔：{format_interval(settings.get("update_seconds"))}']
         if (state.get('device_type') or model_type(state.get('model')))=='D3':lines.append(f'6 气压参考海拔：{settings.get("reference_altitude_m")} 米')
-        lines+=['r 重新读取   w 读实时测量   f 闪灯定位   b 数据库备份',
+        lines+=['r 重新读取  t 时间诊断  w 实时测量  f 闪灯  b 备份',
                 '显示的是上次读取值，修改结果未确认：请先 r 回读' if state.get('read_stale') else self.message]
         if state.get('live'):
             readings=state['live']['measurements']
@@ -802,7 +819,7 @@ class Terminal:
         help_text={
             'set_interval':'单位为秒：300=5分钟，600=10分钟。支持 2/5/10/20/30/60/120/300/360/600/1200/1800/3600/7200/21600/43200。',
             'set_wrap':'输入 on/开启 或 off/关闭；关闭后日志满时停止记录。',
-            'set_time':'输入 now 使用电脑本地时间，或 YYYY-MM-DD HH:MM:SS；旧记录保留。',
+            'set_time':'校时可能平移采样相位，不能保证整5分钟；先下载备份，再检查后续至少两条记录。',
             'batch_set_time':'now 在每台实际写入时取电脑本地时间；请先检查电脑时区，旧记录不变。',
             'batch_set_interval':'单位为秒；每台执行时读取旧值，仅修改采样间隔。',
             'batch_set_wrap':'on/开启 为满后覆盖，off/关闭 为满后停止记录。',
@@ -872,6 +889,7 @@ class Terminal:
         elif item and view['action']=='set-batch':
             lines.append('配置已逐项回读验证并保存审计。' if item['status']=='verified' else STATUSES.get(item['status'],item['status']))
             if item.get('time_write_target_local'):lines.append('实际校时目标：'+item['time_write_target_local'])
+            if item.get('sampling_risk'):lines.append('时钟回读通过不代表整点采样；返回按 t 诊断后续记录。')
             if item['status']!='verified':lines.append('先读取本台设置核对，再决定是否重新配置。')
         elif item and item.get('status')=='pending':
             lines.append('仍有数据未完成确认；请保留档案，等待新样本后重试。')

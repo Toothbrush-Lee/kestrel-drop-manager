@@ -36,10 +36,11 @@ def setting_change(action, value, state):
         return str(item) if item != '' else '默认名称'
     impact = '只修改此项，其余设置保持。写入后会回读核验并保存操作审计。'
     if field == 'time':
-        impact = '只修改设备当前时钟；旧记录不变，之后的记录时间可能跳变。'
+        impact = '校时可能改变采样相位：300秒不保证整5分钟，可能跳时或重复时间。逐台校时也不保证机群同步；需检查后续至少两条记录。'
     elif field == 'wrap':
         impact = '满后覆盖设备中最早的记录，电脑已保存的数据保留。' if converted else '设备日志满后停止保存新记录。'
     args = ['set', state['serial'], flag, value, '--execute']
+    if field=='time': args+=['--allow-schedule-shift']
     if state.get('ble_id'): args += ['--ble-id', state['ble_id']]
     return {'serial': state['serial'], 'label': label, 'old': display(old),
             'new': '提交时的电脑本地时间' if field == 'time' and value == 'now' else display(converted),
@@ -94,6 +95,7 @@ def batch_setting_change(action, value, targets):
                   arguments=['set-batch', '--serials', *[item['serial'] for item in targets],
                              '--ble-ids', *[item.get('ble_id') or '-' for item in targets],
                              *flag, '--execute'])
+    if action == 'batch_set_time':single['arguments']+=['--allow-schedule-shift']
     if action == 'batch_set_time' and value == 'now':
         single['new'] = '每台实际写入时的电脑本地时间（逐台同步）'
     return single

@@ -1,6 +1,6 @@
 # Kestrel DROP 电脑下载管理
 
-扫描设备、批量下载 D1/D2/D3 历史，统一保存在电脑的 SQLite 档案库，按需导出 Excel 可打开的 CSV。当前版本 **0.12.0**，面向日常采集与多设备管理。
+扫描设备、批量下载 D1/D2/D3 历史，统一保存在电脑的 SQLite 档案库，按需导出 Excel 可打开的 CSV。当前版本 **0.12.1**，面向日常采集与多设备管理。
 
 ## 快速开始
 
@@ -39,6 +39,17 @@ uv run kestrel.py
 
 下载结果中的“已保存，有提醒”表示观测和游标已完整提交，但设备结束确认未能发送；正常使用已保存数据，下次增量同步即可。“有数据尚未确认”则表示材料仍在暂存区，两者含义不同。首次下载重试需要从零重读，旧尝试材料会单独计数，成功完成后清理。
 
+## 校时与整点采样
+
+**每300秒记录一次，不保证落在整5分钟。校时可能平移记录相位，回读时钟正确不代表采样对齐。** 设置前先下载备份，设置后核对至少两条新历史。TUI 按 **t** 做离线时间诊断，可输入预期间隔；CLI 使用下面的只读命令：
+
+```sh
+uv run kestrel.py timing --interval 300
+uv run kestrel.py timing 设备编号 --interval 300
+```
+
+CLI 执行校时还需明确添加 `--allow-schedule-shift`；TUI 会先显示相位风险供确认。接近同步的时钟（误差不超过1秒）会跳过重复写入。同值设置不再重写；这些保护不会自动修复既有相位，也不会取整历史时间。详细规则见 [时钟与采样](docs/clock-and-sampling.md)。
+
 ## 数据在哪里
 
 顶部显示实际数据目录，o 可打开。本项目现有安装继续使用 `archive/`；新安装 macOS 默认 `~/Library/Application Support/KestrelDrop/`，Linux 默认 `~/.local/share/kestrel-drop/`，也可使用保存位置或环境变量。
@@ -54,7 +65,7 @@ uv run kestrel.py
 | 目录分工、开发、测试和 Git | [开发与维护规范](docs/development.md) |
 | 数据表、事务、续传和迁移 | [存储设计](docs/storage.md) |
 | 官方协议依据及硬件验证范围 | [协议适配](docs/official-protocol.md) |
-| 本轮测试与验证边界 | [0.12 可靠性与性能验证](docs/validation-0.12.md) |
+| 本轮测试与验证边界 | [0.12.1 校时安全验证](docs/validation-0.12.1.md) |
 | 全部文档与版本变化 | [文档索引](docs/README.md) · [变更记录](CHANGELOG.md) |
 
 0.12 保持 schema 4；从 0.8 升级无需迁移。更早版本请先阅读[升级流程](docs/user-guide.md)。

@@ -98,6 +98,7 @@ def validate_changes(changes):
 
 
 def settings_payload(raw, changes):
+    """Expected readback bytes; outgoing writes use selective_settings_payload."""
     old = decode_settings(raw)
     payload = bytearray(raw)
     for field in ('interval_seconds', 'wrap', 'update_seconds', 'reference_altitude_m'):
@@ -107,6 +108,23 @@ def settings_payload(raw, changes):
     if 'update_seconds' in changes: payload[4] = changes['update_seconds']
     if 'reference_altitude_m' in changes: payload[7:9] = changes['reference_altitude_m'].to_bytes(2, 'little', signed=True)
     return bytes(payload)
+
+
+def selective_settings_payload(raw, changes):
+    """DROP table 94 ignore markers keep unselected settings out of the write."""
+    expected=settings_payload(raw,changes)
+    payload=bytearray(expected)
+    for field,start,end,ignored in (
+        ('interval_seconds',0,3,b'\xff'*3),('wrap',3,4,b'\xff'),
+        ('update_seconds',4,5,b'\xff'),('security_level',5,6,b'\xff'),
+        ('setup_complete',6,7,b'\xff'),('reference_altitude_m',7,9,b'\x01\x80')):
+        if field not in changes:payload[start:end]=ignored
+    return bytes(payload),expected
+
+
+def clock_risk(changes):
+    return {'schedule_alignment_verified':False,
+            'warning':'校时可能平移后续记录相位，产生跳时或重复时间；300秒间隔不保证整5分钟采样。需观察之后至少两条记录确认。'} if 'time' in changes else None
 
 
 async def inspect(client, *, stable=None, clock_read=None):
@@ -138,35 +156,51 @@ async def inspect(client, *, stable=None, clock_read=None):
     return result
 
 
-async def apply(client, changes, before):
+async def apply(client, changes, before, *, allow_schedule_shift=False):
     """Write individually, verify each field, never retry an ambiguous write."""
     changes = validate_changes(changes)
+    if 'time' in changes and allow_schedule_shift is not True:
+        raise ValueError('校时可能改变采样相位；请先查看 timing 报告，确认风险后使用 --allow-schedule-shift')
     if before.get('settings') is None and any(k in changes for k in ('interval_seconds','wrap','update_seconds','reference_altitude_m')):
         raise TransferError('未读到设备当前设置，拒绝覆盖')
     async def write(characteristic, payload):
         await gatt_wait(client.write_gatt_char(characteristic, payload, response=True), 15)
     if any(k in changes for k in ('interval_seconds','wrap','update_seconds','reference_altitude_m')):
-        payload = settings_payload(bytes.fromhex(before['settings_raw_hex']), changes)
-        await write(SETTINGS_UUID, payload)
+        raw_before=bytes.fromhex(before['settings_raw_hex'])
+        effective={key:value for key,value in changes.items() if key in before['settings'] and before['settings'][key]!=value}
+        payload,expected=selective_settings_payload(raw_before,effective)
+        if effective: await write(SETTINGS_UUID, payload)
         actual_raw=bytes(await gatt_wait(client.read_gatt_char(SETTINGS_UUID),15))
         actual = decode_settings(actual_raw)
         for field in changes.keys() & actual.keys():
             if actual[field] != changes[field]: raise TransferError(f'{field} 写入后回读不一致；请重新读取，不自动重试')
-        if actual_raw!=payload: raise TransferError('设置中未选择的字节发生变化；请重新读取核对')
+        if actual_raw!=expected: raise TransferError('设置中未选择的字节发生变化；请重新读取核对')
     if 'name' in changes:
-        await write(NAME_UUID, changes['name'].encode('ascii').ljust(20, b'\0'))
+        if before.get('name')!=changes['name']:
+            await write(NAME_UUID, changes['name'].encode('ascii').ljust(20, b'\0'))
         actual = bytes(await gatt_wait(client.read_gatt_char(NAME_UUID), 15)).rstrip(b'\0').decode('ascii')
         if actual != changes['name']: raise TransferError('设备名称写入后回读不一致')
     clock_read = None
+    clock_before=None;skipped=False
     if 'time' in changes:
-        value = datetime.now().astimezone().replace(tzinfo=None, microsecond=0).isoformat(sep=' ') if changes['time']=='now' else changes['time']
-        clock_read = await clock(client,value)
+        clock_before=await clock(client)
+        computer_clock=datetime.now().astimezone().replace(microsecond=0)
+        value = computer_clock.replace(tzinfo=None).isoformat(sep=' ') if changes['time']=='now' else changes['time']
+        correction=(datetime.fromisoformat(value)-datetime.fromisoformat(clock_before[0])).total_seconds()
+        skipped=changes['time']=='now' and abs(correction)<=1
+        clock_read=clock_before if skipped else await clock(client,value)
         actual,_ = clock_read
         delta = (datetime.fromisoformat(actual)-datetime.fromisoformat(value)).total_seconds()
-        if not 0 <= delta <= 10: raise TransferError('设备时间写入后回读偏差过大，请重新读取')
+        if not skipped and not 0 <= delta <= 10: raise TransferError('设备时间写入后回读偏差过大，请重新读取')
     # Reuse only stable fields and the clock read already verified on this connection.
     after = await inspect(client, stable=before, clock_read=clock_read)
-    if 'time' in changes: after['time_write_target_local'] = value
+    if any(k in changes for k in ('interval_seconds','wrap','update_seconds','reference_altitude_m')):
+        after.update(settings_write_skipped=not bool(effective),settings_written_fields=sorted(effective))
+    if 'time' in changes:
+        after.update(time_write_target_local=value,time_write_skipped=skipped,
+                     computer_time_at_check=computer_clock.isoformat(),
+                     clock_before_write_local=clock_before[0],clock_correction_seconds=correction,
+                     sampling_risk=clock_risk(changes))
     return after
 
 

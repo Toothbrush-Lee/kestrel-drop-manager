@@ -199,12 +199,12 @@ class ConfigurationReadReuseTests(unittest.IsolatedAsyncioTestCase):
         with fake.patches(),patch.object(fake.client,'read_gatt_char',wraps=fake.client.read_gatt_char) as read:
             before=await control.inspect(fake.client)
             fake.values[control.BATTERY_UUID]=b'\x50'
-            after=await control.apply(fake.client,{'time':'2026-10-27 01:00:00'},before)
+            after=await control.apply(fake.client,{'time':'2026-10-27 01:00:00'},before,allow_schedule_shift=True)
         names=[call.args[0] for call in read.await_args_list]
         self.assertEqual(names.count(control.FIRMWARE_UUID),1);self.assertEqual(names.count(control.HARDWARE_UUID),1)
         self.assertEqual(names.count(control.BATTERY_UUID),2);self.assertEqual(after['battery_pct'],80)
         commands=[int.from_bytes(frame.payload[:2],'little') for frame in fake.mass_writes if frame.kind==0]
-        self.assertEqual(commands.count(14),2);self.assertEqual(commands.count(15),1)
+        self.assertEqual(commands.count(14),3);self.assertEqual(commands.count(15),1)
         self.assertEqual(after['device_time'],'2026-10-27 01:00:00')
     async def test_failed_stable_field_is_retried_not_cached_as_success(self):
         fake=FakeControl();original=fake.client.read_gatt_char;fail=True

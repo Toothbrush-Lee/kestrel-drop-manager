@@ -66,7 +66,7 @@ def validate_result(action, data):
         for item in outcomes:
             if not isinstance(item,dict) or not isinstance(item.get('serial'),str) or item.get('status') not in ('verified','failed','dry_run','cancelled_unknown','not_attempted'):
                 raise ValueError('invalid configuration outcome')
-    if action=='set' and (not isinstance(data.get('before'),dict) or not isinstance(data.get('after'),dict)):
+    if action=='set' and data.get('status')!='dry_run' and (not isinstance(data.get('before'),dict) or not isinstance(data.get('after'),dict)):
         raise ValueError('configuration result lacks before/after state')
     return data
 

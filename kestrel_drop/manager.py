@@ -123,6 +123,17 @@ class Library:
                     {'source_sha256': state['csv_sha256'], 'metadata_sha256': protocol._sha256(evidence)})
         return self.database_path
 
+    def timing(self, serial=None, *, interval=300, recent=100):
+        from .timing import analyze
+        serials=[serial_number(serial)] if serial else [row['serial'] for row in self.store.overview()]
+        result=[]
+        for item in serials:
+            with closing(self.store.iter_query(item)) as records:
+                evidence=analyze(records,interval,recent)
+            evidence.update(serial=item,clock_actions=[action for action in self.store.actions(item,1000) if 'time' in action['requested']])
+            result.append(evidence)
+        return {'devices':result,'read_only':True,'expected_interval_seconds':interval}
+
     def complete_download(self, serial, previous=0, code=0, warning=None):
         info = next(iter(self.status(serial)), None)
         if info and info.get('error'):
@@ -216,14 +227,16 @@ class Library:
             result, warning = 0, describe(exc)
         return self.complete_download(serial, previous=before, code=result, warning=warning)
 
-    async def device_operation(self, serial, *, ble_id=None, timeout=20, changes=None, execute=False, blink=False, samples=0, period=2):
+    async def device_operation(self, serial, *, ble_id=None, timeout=20, changes=None, execute=False, blink=False, samples=0, period=2, allow_schedule_shift=False):
         from . import control
         serial = serial_number(serial)
         if timeout <= 0 or not 0 <= samples <= 10000 or not 0.2 <= period <= 3600:
             raise ValueError('设备查询参数超出有效范围')
         if changes is not None:
             changes = control.validate_changes(changes)
-            if not execute: return {'serial':serial,'status':'dry_run','changes':changes,'note':'未访问蓝牙；--execute 后逐项写入并回读验证'}
+            if not execute: return {'serial':serial,'status':'dry_run','changes':changes,'sampling_risk':control.clock_risk(changes),'note':'未访问蓝牙；--execute 后逐项写入并回读验证'}
+        if changes and 'time' in changes and allow_schedule_shift is not True:
+            raise ValueError('校时可能改变采样相位；请先查看 timing 报告，确认风险后使用 --allow-schedule-shift')
         if blink and not execute: return {'serial':serial,'status':'dry_run','action':'blink','note':'--execute 后闪灯定位'}
         timings = {}
         started = time.monotonic()
@@ -268,7 +281,7 @@ class Library:
                             payload=bytearray(20);payload[1]=1
                             await devices.gatt_wait(client.write_gatt_char(control.COMMANDS_UUID,bytes(payload),response=True),15)
                             after={'command_acknowledged':True,'visual_confirmation_required':True}
-                        else: after=await control.apply(client,changes,before)
+                        else: after=await control.apply(client,changes,before,allow_schedule_shift=allow_schedule_shift)
                         timings['write_verify'] = time.monotonic() - write_started
                         audit_started = time.monotonic()
                         store.finish_action(action,after=after)
@@ -371,6 +384,10 @@ def parser():
     download.add_argument('--parallel', type=int, default=1, help='并发连接数 1–8；建议从 2 开始')
     download.add_argument('--execute', action='store_true', help='执行设备历史读取指令')
     sub.add_parser('overview', help='关联设备、条数、游标和最近下载时间的只读总览')
+    timing=sub.add_parser('timing',help='只读检查原始采样时间、相位与校时审计，不访问蓝牙')
+    timing.add_argument('serial',type=serial_number,nargs='?')
+    timing.add_argument('--interval',type=int,default=300,help='预期采样间隔秒数，默认300；是诊断假设，不修改设备')
+    timing.add_argument('--recent',type=int,default=100)
     audit=sub.add_parser('actions',help='只读查看设备配置审计记录')
     audit.add_argument('serial',type=serial_number)
     audit.add_argument('--limit',type=int,default=20)
@@ -386,6 +403,7 @@ def parser():
             device.add_argument('--update-seconds',type=int)
             device.add_argument('--reference-altitude',type=int)
             device.add_argument('--name')
+            device.add_argument('--allow-schedule-shift',action='store_true',help='确认校时可能改变采样相位；不代表恢复整点采样')
             device.add_argument('--time',help='设备本地时间 ISO 格式，或 now 使用电脑当前本地时间')
         if command=='live':
             device.add_argument('--samples',type=int,default=1)
@@ -398,6 +416,7 @@ def parser():
     batch.add_argument('--interval', type=int)
     batch.add_argument('--wrap', choices=('on','off'))
     batch.add_argument('--update-seconds', type=int)
+    batch.add_argument('--allow-schedule-shift',action='store_true',help='确认逐台校时可能使机群采样相位不同')
     batch.add_argument('--time', help='now 在每台实际写入时取电脑本地时间')
     imp = sub.add_parser('import', help='验证旧完整 CSV 与 .csv.json 并入库，不改源文件')
     imp.add_argument('csv', type=Path)
@@ -484,6 +503,8 @@ def _run(args):
             result = library.records(args.serial, args.limit)
         elif args.command == 'actions':
             result=library.store.actions(args.serial,args.limit)
+        elif args.command == 'timing':
+            result=library.timing(args.serial,interval=args.interval,recent=args.recent)
         elif args.command == 'overview':
             result=library.store.overview()
         elif args.command in ('device','set','blink','live'):
@@ -494,7 +515,8 @@ def _run(args):
             if args.command=='live' and args.samples < 1: raise ValueError('实时样本数必须为 1–10000')
             result=asyncio.run(library.device_operation(args.serial,ble_id=args.ble_id,timeout=args.timeout,
                 changes=changes,execute=getattr(args,'execute',False),blink=args.command=='blink',
-                samples=getattr(args,'samples',0),period=getattr(args,'period',2)))
+                samples=getattr(args,'samples',0),period=getattr(args,'period',2),
+                allow_schedule_shift=getattr(args,'allow_schedule_shift',False)))
         elif args.command == 'set-batch':
             from .batch_settings import targets, configure as configure_batch
             changes = {key: value for key, value in (
@@ -503,7 +525,7 @@ def _run(args):
                 ('update_seconds', args.update_seconds), ('time', args.time)) if value is not None}
             selected = targets(args.serials, args.ble_ids)
             result = asyncio.run(configure_batch(library, selected, changes,
-                                                 execute=args.execute, timeout=args.timeout))
+                                                 execute=args.execute, timeout=args.timeout,allow_schedule_shift=args.allow_schedule_shift))
             events.result(result)
             return 2 if result['incomplete'] else 0
         elif args.command == 'download':

@@ -50,7 +50,7 @@ class SelectionTests(unittest.TestCase):
             t.handle('g');t.handle('3');t.handle('\n');start.assert_not_called()
             self.assertEqual([i['serial'] for i in t.review['targets']],['0','1'])
             t.marked={'99'};t.handle('\n')
-            start.assert_called_once_with('set-batch',['set-batch','--serials','0','1','--ble-ids','a0','a1','--time','now','--execute'])
+            start.assert_called_once_with('set-batch',['set-batch','--serials','0','1','--ble-ids','a0','a1','--time','now','--execute','--allow-schedule-shift'])
         self.assertIsNone(t.batch_settings)
     def test_preview_escape_preserves_form_without_writing(self):
         t=self.terminal();t.marked={'0','1'}
@@ -124,7 +124,7 @@ class BatchConfigurationTests(unittest.IsolatedAsyncioTestCase):
         async def cancel(*args,**kwargs):raise asyncio.CancelledError()
         output=io.StringIO()
         with fake.patches(),patch.object(manager.devices,'resolve',return_value=Item(address='a')),patch.object(control,'apply',side_effect=cancel),events.stream(output):
-            with self.assertRaises(asyncio.CancelledError):await batch_settings.configure(self.library,{'123':'a','456':'b'},{'time':'now'},execute=True)
+            with self.assertRaises(asyncio.CancelledError):await batch_settings.configure(self.library,{'123':'a','456':'b'},{'time':'now'},execute=True,allow_schedule_shift=True)
         result=next(json.loads(line)['data'] for line in output.getvalue().splitlines() if json.loads(line)['event']=='result')
         self.assertEqual([i['status'] for i in result['configurations']],['cancelled_unknown','not_attempted'])
         self.assertEqual(self.library.store.actions('123')[0]['status'],'failed_or_unknown')
@@ -139,7 +139,7 @@ class BatchConfigurationTests(unittest.IsolatedAsyncioTestCase):
         factories={a:p.module.BleakClient for a,p in peers.items()}
         async def resolve(args):return Item(address=args.ble_id)
         with peers['a'].patches(),patch('bleak.BleakClient',side_effect=lambda device,**kw:factories[device.address](device,**kw)),patch.object(manager.devices,'resolve',side_effect=resolve),patch.object(control,'datetime',Clock):
-            result=await batch_settings.configure(self.library,{'123':'a','456':'b'},{'time':'now'},execute=True)
+            result=await batch_settings.configure(self.library,{'123':'a','456':'b'},{'time':'now'},execute=True,allow_schedule_shift=True)
         self.assertEqual([i['time_write_target_local'] for i in result['configurations']],['2026-10-27 01:00:01','2026-10-27 01:00:08'])
         for serial,address in [('123','a'),('456','b')]:
             self.assertEqual(self.library.store.actions(serial)[0]['status'],'verified')
@@ -152,7 +152,7 @@ class BatchConfigurationTests(unittest.IsolatedAsyncioTestCase):
             calls.append((serial,kwargs['changes']['time']))
             return {'action_id':len(calls),'after':{'time_write_target_local':f'2026-10-27 01:00:0{len(calls)}'}}
         with patch.object(self.library,'device_operation',side_effect=operation):
-            result=await batch_settings.configure(self.library,{'123':'a','456':'b'},{'time':'now'},execute=True)
+            result=await batch_settings.configure(self.library,{'123':'a','456':'b'},{'time':'now'},execute=True,allow_schedule_shift=True)
         self.assertEqual(calls,[('123','now'),('456','now')])
         self.assertNotEqual(result['configurations'][0]['time_write_target_local'],result['configurations'][1]['time_write_target_local'])
 

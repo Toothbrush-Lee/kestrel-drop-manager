@@ -1,6 +1,6 @@
 # 命令参考
 
-适用于 0.12.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
+适用于 0.12.1。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
 
 ## 基本约定
 
@@ -147,3 +147,9 @@ JSON Lines 每行一个事件，带 `version: 1`，包括 phase/progress/log/err
 Ctrl+C 取消时会清理连接并保留持久化边界；不能把强制杀进程当作正常取消方式。记录诊断文件放临时目录或本地 `data/analysis/主题-日期/`，避免散落根目录；输出可能包含设备身份和观测，不进入代码仓库。
 
 0.12：db 结果包含 journal_mode；status/list 的 superseded_records 为首次旧尝试证据，resumable_records 为可复用的增量暂存数。download 的 saved_warning 表示完整入库后结束 ACK 发送失败，退出码仍为 0，warning 中保留原因与建议；pending 仍表示尚未发布。
+
+## 时间诊断与校时确认
+
+`timing [serial] --interval 300 --recent 100` 只读检查原始设备时间、整点相位和最近1000条配置审计中的校时事件，不访问蓝牙。省略编号检查所有设备；interval是诊断假设，不是对设备实际配置的读取，recent可为2–10000。
+
+执行 `set SERIAL --time now --execute --allow-schedule-shift` 或批量 `set-batch ... --time now --execute --allow-schedule-shift` 才允许校时。仅--execute不足以确认相位风险；预演会返回sampling_risk。操作后sampling_risk.schedule_alignment_verified恒为false，必须另看新历史。time_write_skipped表示无需重复写，clock_correction_seconds记录重新读取RTC后计算的时钟差；computer_time_at_check包含电脑时区。
