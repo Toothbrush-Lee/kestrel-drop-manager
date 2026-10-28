@@ -11,7 +11,7 @@ def render(root):
     import streamlit as st
     from kestrel_drop.browse import Browser,METRICS
 
-    st.set_page_config(page_title='Kestrel DROP 数据浏览',page_icon='📊',layout='wide',initial_sidebar_state='expanded')
+    st.set_page_config(page_title='Kestrel DROP 数据浏览',page_icon='📊',layout='wide')
     st.title('Kestrel DROP 数据浏览')
     st.caption('本机只读 SQLite · 设备原始本地时间 · 不校时、不改设置、不按时间戳去重')
     with st.sidebar:
