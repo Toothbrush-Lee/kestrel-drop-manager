@@ -8,7 +8,7 @@ from kestrel_drop import __version__
 
 a = Analysis([str(root / 'packaging/native_entry.py')], pathex=[str(root)],
              datas=copy_metadata('bleak'), hiddenimports=[],
-             excludes=['tkinter'], noarchive=False)
+             excludes=['tkinter', 'streamlit', 'altair', 'pandas'], noarchive=False)
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='kestrel-drop',
           console=True, strip=False, upx=False)

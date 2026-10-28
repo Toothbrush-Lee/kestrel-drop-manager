@@ -351,6 +351,9 @@ def parser():
     ap.add_argument('--events-json', action='store_true', help='输出版本化 JSON Lines 事件，供 TUI / 自动化使用')
     sub = ap.add_subparsers(dest='command')
     sub.add_parser('tui', help='交互式终端界面')
+    browse=sub.add_parser('browse',help='启动本机只读数据浏览前端（可选viewer组件）')
+    browse.add_argument('--port',type=int,default=8501)
+    browse.add_argument('--no-open',action='store_true',help='只启动服务，不自动打开浏览器')
     scan = sub.add_parser('scan', help='扫描附近 DROP；默认只看广播，可选核验/登记')
     scan.add_argument('--timeout', type=float, default=15, help='广播扫描秒数，默认 15')
     scan.add_argument('--identify', action='store_true', help='逐台连接，只读核验型号与序列号')
@@ -448,6 +451,10 @@ def _run(args):
             events.result({'data_dir': str(configure(args.directory)), 'note': '位置已保存；已有数据未搬动'})
             return 0
         library = Library(args.data_dir)
+        if args.command=='browse':
+            if args.events_json:raise ValueError('browse是交互式服务，请移除--events-json')
+            from .browse import launch
+            return launch(library.root,port=args.port,open_browser=not args.no_open)
         if args.command in (None, 'tui'):
             if args.events_json:
                 raise ValueError('--events-json 仅供非交互子命令使用；打开 TUI 请移除此选项')

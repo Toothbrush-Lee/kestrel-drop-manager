@@ -1,6 +1,6 @@
 # 命令参考
 
-适用于 0.12.1。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
+适用于 0.13.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
 
 ## 基本约定
 
@@ -153,3 +153,12 @@ Ctrl+C 取消时会清理连接并保留持久化边界；不能把强制杀进�
 `timing [serial] --interval 300 --recent 100` 只读检查原始设备时间、整点相位和最近1000条配置审计中的校时事件，不访问蓝牙。省略编号检查所有设备；interval是诊断假设，不是对设备实际配置的读取，recent可为2–10000。
 
 执行 `set SERIAL --time now --execute --allow-schedule-shift` 或批量 `set-batch ... --time now --execute --allow-schedule-shift` 才允许校时。仅--execute不足以确认相位风险；预演会返回sampling_risk。操作后sampling_risk.schedule_alignment_verified恒为false，必须另看新历史。time_write_skipped表示无需重复写，clock_correction_seconds记录重新读取RTC后计算的时钟差；computer_time_at_check包含电脑时区。
+
+## 本机数据浏览
+
+```sh
+uv run --extra viewer kestrel.py browse
+uv run --extra viewer kestrel.py --data-dir /绝对路径/数据目录 browse --port 8502 --no-open
+```
+
+`browse` 使用可选 Streamlit 组件，端口默认8501，仅监听127.0.0.1。`--no-open` 不自动打开浏览器；Ctrl+C关闭。保持终端运行，访问页面上显示的本机地址。只读已存在的 `library.sqlite`，不会建空库、迁移或连接设备；不支持 `--events-json`。独立采集运行包不含此扩展，详见[浏览指南](data-browser.md)。

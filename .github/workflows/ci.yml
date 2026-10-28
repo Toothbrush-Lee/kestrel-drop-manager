@@ -69,3 +69,19 @@ jobs:
           path: ${{ runner.temp }}/python-dist/*
           if-no-files-found: error
           retention-days: 7
+
+  viewer:
+    name: Optional data browser
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: '0.13.5'
+          python-version: '3.13'
+          enable-cache: true
+      - run: uv sync --locked --extra viewer
+      - run: uv run --locked --extra viewer python -B tests/run.py -q

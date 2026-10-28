@@ -1,6 +1,6 @@
 # Kestrel DROP 电脑下载管理
 
-扫描设备、批量下载 D1/D2/D3 历史，统一保存在电脑的 SQLite 档案库，按需导出 Excel 可打开的 CSV。当前版本 **0.12.1**，面向日常采集与多设备管理。
+扫描设备、批量下载 D1/D2/D3 历史，统一保存在电脑的 SQLite 档案库，按需导出 Excel 可打开的 CSV。当前版本 **0.13.0**，面向日常采集与多设备管理。
 
 ## 快速开始
 
@@ -50,6 +50,18 @@ uv run kestrel.py timing 设备编号 --interval 300
 
 CLI 执行校时还需明确添加 `--allow-schedule-shift`；TUI 会先显示相位风险供确认。接近同步的时钟（误差不超过1秒）会跳过重复写入。同值设置不再重写；这些保护不会自动修复既有相位，也不会取整历史时间。详细规则见 [时钟与采样](docs/clock-and-sampling.md)。
 
+## 浏览已下载的数据
+
+在源码项目目录运行：
+
+```bash
+uv run --extra viewer kestrel.py browse
+```
+
+首次会安装可选的 Streamlit 浏览组件，随后打开本机页面。选择设备和起止时间，即可看交互图表、分页表格和导出筛选结果。它只读现有 SQLite，可与采集程序同时运行；不需要连接设备。页面仅监听本机，不上传数据。
+
+独立采集运行包不包含浏览组件；浏览功能目前需源码环境或安装带 `viewer` 扩展的 Python 包。数据目录需与采集端一致。操作和限制见[数据浏览指南](docs/data-browser.md)。
+
 ## 数据在哪里
 
 顶部显示实际数据目录，o 可打开。本项目现有安装继续使用 `archive/`；新安装 macOS 默认 `~/Library/Application Support/KestrelDrop/`，Linux 默认 `~/.local/share/kestrel-drop/`，也可使用保存位置或环境变量。
@@ -61,6 +73,7 @@ CLI 执行校时还需明确添加 `--allow-schedule-shift`；TUI 会先显示�
 | 需求 | 文档 |
 | --- | --- |
 | 安装、百台采集、按键、设备设置、备份恢复、常见问题 | [详细用户手册](docs/user-guide.md) |
+| 设备与时间筛选、图表、分页与CSV | [数据浏览指南](docs/data-browser.md) |
 | 脚本、参数、批量地址映射、退出码 | [命令参考](docs/cli.md) |
 | 目录分工、开发、测试和 Git | [开发与维护规范](docs/development.md) |
 | 数据表、事务、续传和迁移 | [存储设计](docs/storage.md) |
@@ -68,7 +81,7 @@ CLI 执行校时还需明确添加 `--allow-schedule-shift`；TUI 会先显示�
 | 本轮测试与验证边界 | [0.12.1 校时安全验证](docs/validation-0.12.1.md) |
 | 全部文档与版本变化 | [文档索引](docs/README.md) · [变更记录](CHANGELOG.md) |
 
-0.12 保持 schema 4；从 0.8 升级无需迁移。更早版本请先阅读[升级流程](docs/user-guide.md)。
+0.13 保持 schema 4；从 0.8 升级无需迁移。更早版本请先阅读[升级流程](docs/user-guide.md)。
 
 ## 项目与验证
 
