@@ -61,4 +61,6 @@ uv run --locked --extra viewer python -B tests/run.py -q
 
 覆盖只读文件保持不变、读写并发快照、时间边界、重复时间与不同序号、空选区、缺失档案、分页、图表上限、CSV上限，以及真实Streamlit AppTest中的设备切换、筛选、错误提示与导出。CI另设可选浏览组件任务；不安装扩展时只跳过UI测试，数据库查询测试仍运行。
 
+2026-10-28 本机验证：含可选组件的334项测试全部通过；不含组件的独立安装环境334项通过（4项UI测试跳过），安装版CLI/TUI冒烟通过。现有四台设备共37,220条正式观测，对每台完整时间范围查询计数、首屏和概览，约5–11ms；这是本机样本，不代表百万条性能或浏览器绘图耗时。GitHub CI另覆盖Linux Python 3.11/3.13/3.14、macOS Python 3.14、Python包审计及可选组件交互测试。
+
 实现入口为 `kestrel_drop/browse.py`（只读查询与服务启动）和 `kestrel_drop/viewer.py`（页面）。官方组件文档：[Streamlit](https://docs.streamlit.io/)、[AppTest](https://docs.streamlit.io/develop/api-reference/app-testing)。

@@ -103,7 +103,7 @@ def launch(root,*,port=8501,open_browser=True):
     from . import viewer
     command=[sys.executable,'-m','streamlit','run',str(Path(viewer.__file__).resolve()),
              '--server.address','127.0.0.1','--server.port',str(port),
-             '--server.headless',str(not open_browser).lower(),'--browser.gatherUsageStats','false','--client.toolbarMode','minimal',
+             '--server.headless',str(not open_browser).lower(),'--browser.gatherUsageStats','false','--client.toolbarMode','viewer',
              '--','--data-dir',str(Path(root).resolve())]
     print(f'只读数据浏览：http://127.0.0.1:{port} · Ctrl+C关闭；数据库：{Path(root)/"library.sqlite"}',flush=True)
     try:return subprocess.call(command)

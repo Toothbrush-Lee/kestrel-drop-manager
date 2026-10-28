@@ -79,6 +79,7 @@ class BrowserTests(unittest.TestCase):
         args=call.call_args.args[0]
         self.assertEqual(args[args.index('--server.address')+1],'127.0.0.1')
         self.assertEqual(args[args.index('--browser.gatherUsageStats')+1],'false')
+        self.assertEqual(args[args.index('--client.toolbarMode')+1],'viewer')
         with redirect_stdout(io.StringIO()),redirect_stderr(io.StringIO()):
             self.assertEqual(manager.main(['--events-json','browse']),2)
 

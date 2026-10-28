@@ -78,7 +78,7 @@ uv run --extra viewer kestrel.py browse
 | 目录分工、开发、测试和 Git | [开发与维护规范](docs/development.md) |
 | 数据表、事务、续传和迁移 | [存储设计](docs/storage.md) |
 | 官方协议依据及硬件验证范围 | [协议适配](docs/official-protocol.md) |
-| 本轮测试与验证边界 | [0.12.1 校时安全验证](docs/validation-0.12.1.md) |
+| 校时测试与验证边界 | [0.12.1 校时安全验证](docs/validation-0.12.1.md) |
 | 全部文档与版本变化 | [文档索引](docs/README.md) · [变更记录](CHANGELOG.md) |
 
 0.13 保持 schema 4；从 0.8 升级无需迁移。更早版本请先阅读[升级流程](docs/user-guide.md)。
