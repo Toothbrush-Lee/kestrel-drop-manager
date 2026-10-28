@@ -55,6 +55,7 @@ class UpgradeTests(unittest.TestCase):
         Store(self.path).check()
         self.assertFalse((self.path.parent/'backups').exists())
         store=Store(self.path,create=True);store.check()
+        with store.connect() as c:self.assertEqual(c.execute('PRAGMA journal_mode').fetchone()[0],'wal')
         self.assertEqual(store.status()[0]['pending_records'],1)
         backups=list((self.path.parent/'backups').glob('*.sqlite'))
         self.assertEqual(len(backups),1);Store(backups[0]).check()

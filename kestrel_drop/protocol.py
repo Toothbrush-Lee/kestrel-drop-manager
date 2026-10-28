@@ -29,7 +29,7 @@ import uuid
 
 from .events import emit
 from .devices import model_type
-from .errors import TransferError, DeviceMismatch, BluetoothFailure
+from .errors import TransferError, DeviceMismatch, BluetoothFailure, CompletionAckFailure
 
 SYNC = 0x7E
 ESC = 0x7D
@@ -448,7 +448,7 @@ class TransferProgress:
             return
         self.update(self.received, force=True,
                     status=('saved and verified' if success else
-                            'stopped; partial CSV retained' if partial_saved else
+                            'stopped; durable recovery data retained' if partial_saved else
                             'stopped / not saved'))
         if self.terminal:
             self.stream.write('\n')
@@ -458,10 +458,10 @@ class TransferProgress:
 
 class BleSession:
     """Official LiNK mass-transfer client with model-specific schema validation."""
-    def __init__(self,client, *, model=None):
+    def __init__(self,client, *, model):
         from .layouts import profile
-        self.layout = profile(model or 'D3')
-        self.require_schema = model is not None
+        self.layout = profile(model)
+        self.require_schema = True
         self.client=client
         self.parser=FrameStream()
         self.queue:asyncio.Queue[Frame]=asyncio.Queue()
@@ -584,7 +584,11 @@ class BleSession:
                 if on_complete is not None:
                     # Native storage publishes completion durably before ACK too.
                     on_complete(rows, blocks, next_cursor)
-                await self.ack(18)
+                try:
+                    await self.ack(18)
+                except Exception as exc:
+                    if on_complete is None: raise
+                    raise CompletionAckFailure(f'数据已保存，结束确认未能发送：{exc}') from exc
                 break
             raise TransferError('Unexpected frame while reading logs: '+str(frame.to_json()))
         if self.parser.errors:raise RuntimeError(f'Failed frame integrity: {self.parser.errors}')
@@ -608,6 +612,13 @@ class BleSession:
                 )
         return rows,blocks,next_cursor
 
+
+
+class LegacyBleSession(BleSession):
+    """Explicit pre-official D3 dialect, solely for old CSV diagnostics/fixtures."""
+    def __init__(self, client):
+        super().__init__(client, model='D3')
+        self.require_schema = False
 
 
 def verify_completed_transfer(*, rows, blocks, initial_count: int, requested_cursor: int,
@@ -1114,7 +1125,8 @@ async def _sync_live_locked(args):
         model=(await client.read_gatt_char(MODEL_UUID)).decode('utf-8','replace').strip('\x00 ')
         if serial != state['serial'] or model_type(model) != 'D3':
             raise DeviceMismatch(f'Connected to an unexpected device: {serial} {model}. No command sent.')
-        session=BleSession(client)
+        print('旧 CSV 诊断使用旧协议方言；日常 D1/D2/D3 采集请运行 kestrel.py。')
+        session=LegacyBleSession(client)
         await client.start_notify(UP_UUID,session.callback)
         try:
             emit('phase', serial=args.serial, phase='querying')
@@ -1229,7 +1241,8 @@ async def _read_connected_d3(client, args, output):
         raise DeviceMismatch(f'Serial mismatch: expected {args.serial}, connected {serial}. No command sent.')
     if model_type(model) != 'D3':
         raise DeviceMismatch(f'Unsupported or unexpected model {model!r}; this D3 parser is not valid for D2')
-    session=BleSession(client)
+    print('旧 CSV 诊断使用旧协议方言；日常 D1/D2/D3 采集请运行 kestrel.py。')
+    session=LegacyBleSession(client)
     await client.start_notify(UP_UUID,session.callback)
     try:
         emit('phase', serial=args.serial, phase='querying')

@@ -24,9 +24,13 @@ def validate_event(event):
     for key in ('serial','phase','message','action','status'):
         if key in event and event[key] is not None and not isinstance(event[key],str):
             raise ValueError('invalid text field '+key)
-    for key in ('received','expected','added_records','total_records','pending_records'):
+    for key in ('received','expected','added_records','total_records','pending_records','superseded_records','resumable_records'):
         if key in event and (type(event[key]) is not int or event[key]<0):
             raise ValueError('invalid count '+key)
+    if 'warning' in event:
+        warning=event['warning']
+        if not isinstance(warning,dict) or any(not isinstance(warning.get(key),str) for key in ('code','message','action')):
+            raise ValueError('invalid completion warning')
     if kind=='progress':
         for key in ('rate','elapsed','eta'):
             value=event[key]

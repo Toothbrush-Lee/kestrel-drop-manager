@@ -23,7 +23,7 @@ from . import protocol, __version__
 from .database import Store, FIELDS
 from .storage import default_root, writer_lock, legacy_archives, migrate, configure
 from . import events
-from .errors import MigrationRequired, ConfigurationFailure, describe
+from .errors import MigrationRequired, ConfigurationFailure, CompletionAckFailure, describe
 
 from . import devices
 from .devices import DROP_SERVICE, serial_number
@@ -123,7 +123,7 @@ class Library:
                     {'source_sha256': state['csv_sha256'], 'metadata_sha256': protocol._sha256(evidence)})
         return self.database_path
 
-    def complete_download(self, serial, previous=0, code=0):
+    def complete_download(self, serial, previous=0, code=0, warning=None):
         info = next(iter(self.status(serial)), None)
         if info and info.get('error'):
             raise RuntimeError(info['error'])
@@ -131,8 +131,12 @@ class Library:
         outcome = {'serial': serial, 'status': 'pending' if code else 'empty' if not total else 'downloaded' if total > previous else 'up_to_date',
                    'added_records': total - previous, 'total_records': total,
                    'pending_records': info['pending_records'] if info else 0,
+                   'superseded_records': info.get('superseded_records',0) if info else 0,
+                   'resumable_records': info.get('resumable_records',0) if info else 0,
                    'first_timestamp': info['first_timestamp'] if info else None,
                    'last_timestamp': info['last_timestamp'] if info else None, 'code': code}
+        if warning:
+            outcome.update(status='saved_warning', warning=warning)
         self.download_results[serial] = outcome
         events.emit('completed', **outcome)
         return code
@@ -177,7 +181,7 @@ class Library:
                     events.emit('phase', serial=serial, phase='querying')
                     count = await session.query_count(cursor)
                     if not count:
-                        return 3 if pending or any(d['serial'] == serial and d['pending_records'] for d in store.status(serial)) else 0
+                        return 3 if pending or any(d['pending_records'] or d.get('superseded_records') for d in store.status(serial)) else 0
                     if count > maxrows:
                         raise RuntimeError('设备报告的记录数超过 --maxrows；可能存在历史缺口，未继续读取')
                     transfer_id = store.begin_transfer(serial, cursor, count)
@@ -193,6 +197,9 @@ class Library:
                         await session.download_from_cursor(cursor, count, maxrows, progress=progress,
                             on_block=lambda rows, blocks: store.append_block(transfer_id, rows, blocks), on_complete=complete)
                         progress.finish(success=True)
+                    except CompletionAckFailure:
+                        progress.finish(success=True)
+                        raise
                     except BaseException:
                         progress.finish(success=False, partial_saved=True)
                         raise
@@ -202,8 +209,12 @@ class Library:
                     try: await client.stop_notify(protocol.UP_UUID)
                     except Exception:
                         if not primary_error: raise
-        result = await _ble_call(connected)
-        return self.complete_download(serial, previous=before, code=result)
+        warning = None
+        try:
+            result = await _ble_call(connected)
+        except CompletionAckFailure as exc:
+            result, warning = 0, describe(exc)
+        return self.complete_download(serial, previous=before, code=result, warning=warning)
 
     async def device_operation(self, serial, *, ble_id=None, timeout=20, changes=None, execute=False, blink=False, samples=0, period=2):
         from . import control

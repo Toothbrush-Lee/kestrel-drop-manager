@@ -56,7 +56,7 @@ def retry_download_arguments(arguments, outcomes, failures):
         end = next((i for i in range(start, len(arguments)) if arguments[i].startswith('--')), len(arguments))
         return arguments[start:end]
     requested = values('--serials')
-    saved = {item['serial'] for item in outcomes if item.get('status') in ('downloaded', 'up_to_date', 'empty', 'dry_run')}
+    saved = {item['serial'] for item in outcomes if item.get('status') in ('downloaded', 'saved_warning', 'up_to_date', 'empty', 'dry_run')}
     blocked = {item['serial'] for item in failures if item.get('serial') and not item.get('retryable')}
     remaining = [serial for serial in requested if serial not in saved and serial not in blocked]
     if not remaining: return None

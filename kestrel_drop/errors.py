@@ -1,7 +1,7 @@
 """Actionable failures shared by transport, CLI and terminal UI."""
 import sqlite3
 
-TITLES = {'configuration_unknown':'配置结果需要回读核对', 'operation_failed': '操作未完成', 'transfer_integrity': '传输校验未通过',
+TITLES = {'completion_ack_failed':'数据已保存，结束确认未送达', 'configuration_unknown':'配置结果需要回读核对', 'operation_failed': '操作未完成', 'transfer_integrity': '传输校验未通过',
           'device_mismatch': '连接的设备与选择不符', 'bluetooth_unavailable': '蓝牙连接不可用',
           'cancelled': '任务已取消', 'already_exists': '目标文件或档案已经存在',
           'not_found': '未找到文件或设备档案', 'invalid_input': '输入内容需要检查',
@@ -14,6 +14,17 @@ class AppError(RuntimeError):
     code = 'operation_failed'
     retryable = False
     action = '查看日志并保留档案文件；不要覆盖已有数据。'
+
+
+class StorageBusy(AppError):
+    code = 'busy'
+    retryable = True
+    action = '等待另一个任务结束，或关闭另一个正在操作该档案的程序后重试。'
+
+
+class CompletionAckFailure(AppError):
+    code = 'completion_ack_failed'
+    action = '数据已完整保存；下次正常增量同步即可。若反复出现，请检查蓝牙连接和日志。'
 
 
 class MigrationRequired(AppError):

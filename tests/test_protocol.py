@@ -3,7 +3,7 @@ import asyncio
 import unittest
 from kestrel_drop.protocol import (
     encode_frame, decode_frame, crc16_x25, FrameStream, Frame,
-    BleSession, decode_record, log_rows_from_frames,
+    LegacyBleSession as BleSession, decode_record, log_rows_from_frames,
 )
 
 class TestProtocol(unittest.TestCase):

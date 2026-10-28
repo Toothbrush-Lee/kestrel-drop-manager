@@ -21,6 +21,7 @@ jobs:
       matrix:
         include:
           - {os: ubuntu-22.04, python: '3.11'}
+          - {os: ubuntu-22.04, python: '3.13'}
           - {os: ubuntu-22.04, python: '3.14'}
           - {os: macos-15, python: '3.14'}
     timeout-minutes: 15
@@ -34,6 +35,7 @@ jobs:
           python-version: ${{ matrix.python }}
           enable-cache: true
       - run: uv sync --locked
+      - run: uv run --locked --group lint ruff check .
       - run: uv run --locked python -B scripts/check_release.py version
       - run: uv run --locked python -B tests/run.py -q
 

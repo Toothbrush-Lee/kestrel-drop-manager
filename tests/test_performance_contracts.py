@@ -76,11 +76,11 @@ class ScopedStatusAndExportTests(unittest.TestCase):
         tid=self.store.begin_transfer('2',0,1)
         decoded=rows((20,));self.store.append_block(tid,decoded,[{'block':0,'records':1}])
         self.store.finish_transfer(tid,next_cursor=1,elapsed_seconds=1,maxrows=20000,received_rows=decoded)
-        original=self.store._pending
+        original=self.store._pending_state
         def pending(connection,history):
             if history['serial']=='2':raise AssertionError('other history decoded')
             return original(connection,history)
-        with patch.object(self.store,'_pending',side_effect=pending):
+        with patch.object(self.store,'_pending_state',side_effect=pending):
             self.store.status('2866855');self.library.complete_download('2866855',previous=3)
     def test_corrupt_pending_of_target_remains_visible(self):
         tid=self.store.begin_transfer('2866855',103,1)

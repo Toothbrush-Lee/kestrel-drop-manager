@@ -577,7 +577,10 @@ class FinalAckTests(unittest.TestCase):
                     raise fake.errors.BleakError('disconnected after publication')
                 return await super().write_gatt_char(uuid,packet,response)
         fake.module.BleakClient=Client
-        with self.assertRaisesRegex(RuntimeError,'蓝牙操作失败'): self.download(fake)
+        self.assertEqual(self.download(fake),0)
+        outcome=self.library.download_results['2866855']
+        self.assertEqual(outcome['status'],'saved_warning')
+        self.assertEqual(outcome['warning']['code'],'completion_ack_failed')
         self.assertEqual(self.library.database_info()['records'],4)
         self.assertEqual(self.library.status()[0]['pending_records'],0)
         self.download(FakeBLE([],104))

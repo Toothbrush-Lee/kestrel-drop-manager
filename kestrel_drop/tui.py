@@ -25,7 +25,7 @@ from .ui_actions import format_interval, setting_change, retry_download_argument
 PHASES = {'scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
           'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
           'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库'}
-STATUSES = {'downloaded': '已保存', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
+STATUSES = {'downloaded': '已保存', 'saved_warning': '已保存，有提醒', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
             'verified': '配置已回读验证', 'not_attempted': '尚未执行', 'cancelled_unknown': '取消，需回读',
             'empty': '设备暂无记录', 'failed': '未完成', 'dry_run': '仅预演'}
 
@@ -177,7 +177,7 @@ class Terminal:
                         # Clear transient errors and old pending counts on refresh.
                         for device in self.devices.values():
                             for field in ('csv', 'error', 'committed_records', 'pending_records',
-                                          'last_timestamp', 'initial_attempts', 'initial_partial_files', 'note',
+                                          'last_timestamp', 'initial_attempts', 'initial_partial_files', 'superseded_records', 'resumable_records', 'note',
                                           'database', 'database_records', 'database_next_cursor', 'database_added_records'):
                                 device.pop(field, None)
                         self.devices = merge_devices(self.devices, payload)
@@ -262,6 +262,7 @@ class Terminal:
                     item.update(database_records=event['total_records'],committed_records=event['total_records'],
                                 pending_records=event['pending_records'],last_timestamp=event.get('last_timestamp'))
             self.job.outcomes.append(event)
+            if event.get('warning'): self.logs.append(event['warning']['message']+'；'+event['warning']['action'])
             self.logs.append(f'{event["serial"]}: {STATUSES.get(event["status"], event["status"])}，'
                              f'新增 {event["added_records"]}，累计 {event["total_records"]}，未确认 {event["pending_records"]}')
         elif kind == 'configured':
@@ -725,7 +726,11 @@ class Terminal:
             self.put(7,'选设备按 Enter 下载；编号未知时先按 x 核验')
             self.put(8,'已下载的数据可离线按 v 查看、e 导出；? 查看帮助',curses.A_DIM)
         row=6+visible
-        for offset,line in enumerate(wrap_lines(self.message,width-3)[:2]): self.put(row+offset,line,curses.A_BOLD)
+        selected=self.selected_device()
+        message=self.message
+        if selected and selected.get('superseded_records') and not self.job:
+            message=f'旧尝试保留 {selected["superseded_records"]} 条证据；首次下载仍从零重读，成功后清理。'
+        for offset,line in enumerate(wrap_lines(message,width-3)[:2]): self.put(row+offset,line,curses.A_BOLD)
         self.put(row+2,self.progress or ('执行中 '+ '|/-\\'[int(time.monotonic()*4)%4] if self.job else '等待操作'))
         log_start=row+4
         for offset,line in enumerate(list(self.logs)[-max(1,height-log_start-3):]):self.put(log_start+offset,line,curses.A_DIM)
@@ -855,7 +860,7 @@ class Terminal:
             line=f'{item["serial"]:<16} {label}' if view['action']=='set-batch' else f'{item["serial"]:<16} {label} {item.get("added_records",0):>6} {item.get("total_records",0):>8} {item.get("pending_records",0):>6}'
             self.put(4+index-top,line,curses.A_REVERSE if index==selected else 0)
         item=outcomes[selected] if outcomes else None
-        failure=(item.get('error') if item else None) or next((f for f in view['failures'] if item and f.get('serial')==item['serial']),None)
+        failure=((item.get('error') or item.get('warning')) if item else None) or next((f for f in view['failures'] if item and f.get('serial')==item['serial']),None)
         if failure is None:failure=next((f for f in view['failures'] if not f.get('serial')),None)
         lines=[]
         if item and item.get('status')!='failed' and view['action']!='set-batch':
@@ -868,7 +873,10 @@ class Terminal:
             lines.append('配置已逐项回读验证并保存审计。' if item['status']=='verified' else STATUSES.get(item['status'],item['status']))
             if item.get('time_write_target_local'):lines.append('实际校时目标：'+item['time_write_target_local'])
             if item['status']!='verified':lines.append('先读取本台设置核对，再决定是否重新配置。')
-        elif item and item.get('status')=='pending':lines.append('仍有数据未完成确认；请保留档案，等待新样本后重试。')
+        elif item and item.get('status')=='pending':
+            lines.append('仍有数据未完成确认；请保留档案，等待新样本后重试。')
+            if item.get('superseded_records'):
+                lines.append(f'另保留旧尝试 {item["superseded_records"]} 条；首次下载需从零重读。')
         elif item and item.get('status')=='empty':lines.append('设备暂无记录；未伪造观测。')
         elif item and item.get('status')=='dry_run':lines.append('仅预演，未访问蓝牙或建立档案。')
         elif item:

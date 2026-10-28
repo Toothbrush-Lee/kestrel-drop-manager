@@ -25,7 +25,7 @@ class StreamBoundaryTests(unittest.IsolatedAsyncioTestCase):
         class Client:
             async def write_gatt_char(self, uuid, packet, response):
                 owner.sent.append(protocol.decode_frame(packet[1:-1]))
-        session = protocol.BleSession(Client())
+        session = protocol.LegacyBleSession(Client())
         async def next_frame(timeout=25):
             if not frames:
                 raise BluetoothFailure('simulated disconnect')
@@ -96,7 +96,7 @@ class StreamBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 frame = protocol.decode_frame(packet[1:-1]); sent.append(frame)
                 if frame.kind == 4:
                     session.callback(None, bytes(bad) + protocol.encode_frame(3, b'\x01\x00' + record(25)))
-        session = protocol.BleSession(Client())
+        session = protocol.LegacyBleSession(Client())
         session.callback(None, protocol.encode_frame(3, b'\x00\x00' + record(20)))
         with self.assertRaises(TransferError):
             await session.download_from_cursor(100, 2, 10, on_block=lambda rows, blocks: saved.extend(rows))

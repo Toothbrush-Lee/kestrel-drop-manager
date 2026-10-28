@@ -18,6 +18,7 @@ import uuid
 
 from . import protocol
 from .database import Store, SCHEMA_VERSION, MEASUREMENTS, checked_rows
+from .errors import StorageBusy
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,7 +58,7 @@ def writer_lock(root):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RuntimeError('Another download or migration is using this data directory') from None
+            raise StorageBusy('Another download or migration is using this data directory；另一个任务正在使用档案') from None
         yield
     finally:
         os.close(fd)

@@ -253,11 +253,18 @@ class ConcurrentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             fleet=Fleet({str(i):{'name':'D1 - '+str(i)} for i in range(1,4)})
             owners={str(i):FakeBLE([RAW[:9]],101,serial=str(i),model='D1',interrupt=True) for i in range(1,4)}
-            active=set();entered=[]
+            active=set();entered=[];both_entered=asyncio.Event()
             def client(device,**kwargs):
                 serial=device.address;base=owners[serial].module.BleakClient
                 class Client(base):
-                    async def __aenter__(self):active.add(serial);entered.append(serial);await asyncio.sleep(.005);return self
+                    async def __aenter__(self):
+                        active.add(serial);entered.append(serial)
+                        if len(entered)==2: both_entered.set()
+                        try: await both_entered.wait()
+                        except BaseException:
+                            active.discard(serial)
+                            raise
+                        return self
                     async def __aexit__(self,*args):active.discard(serial)
                 return Client(device,**kwargs)
             fleet.module.BleakClient=client
