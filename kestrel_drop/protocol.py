@@ -28,7 +28,7 @@ import sys
 import uuid
 
 from .events import emit
-from .devices import model_type
+from .devices import model_type, gatt_wait
 from .errors import TransferError, DeviceMismatch, BluetoothFailure, CompletionAckFailure
 
 SYNC = 0x7E
@@ -477,15 +477,16 @@ class BleSession:
         if self.require_schema:
             # NK mass-transfer characteristics require fixed 20-byte writes.
             for offset in range(0, len(raw), 20):
-                await asyncio.wait_for(self.client.write_gatt_char(DOWN_UUID, raw[offset:offset+20].ljust(20, b'\x00'), response=True),15)
+                await gatt_wait(self.client.write_gatt_char(DOWN_UUID, raw[offset:offset+20].ljust(20, b'\x00'), response=True))
         else:
-            await asyncio.wait_for(self.client.write_gatt_char(DOWN_UUID, raw, response=True),15)
+            await gatt_wait(self.client.write_gatt_char(DOWN_UUID, raw, response=True))
 
     async def next(self,timeout=25) -> Frame:
         if self.parser.errors:
             raise TransferError(f'Failed frame integrity: {self.parser.errors}')
         try:
-            frame = await asyncio.wait_for(self.queue.get(),timeout=timeout)
+            async with asyncio.timeout(timeout):
+                frame = await self.queue.get()
         except asyncio.TimeoutError:
             raise BluetoothFailure('等待设备回复超时；已确认的连续记录已保留。') from None
         if self.parser.errors:

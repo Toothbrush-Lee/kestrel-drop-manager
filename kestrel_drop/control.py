@@ -6,6 +6,7 @@ Library before any write. Erase, defaults, security and firmware are not exposed
 from datetime import datetime
 
 from .errors import TransferError
+from .devices import gatt_wait
 
 BATTERY_UUID = '00002a19-0000-1000-8000-00805f9b34fb'
 FIRMWARE_UUID = '00002a26-0000-1000-8000-00805f9b34fb'
@@ -52,8 +53,7 @@ def encode_link_time(value):
 async def clock(client, value=None):
     from . import protocol
     session=protocol.BleSession(client,model='D1')
-    import asyncio
-    await asyncio.wait_for(client.start_notify(protocol.UP_UUID,session.callback),15)
+    await gatt_wait(client.start_notify(protocol.UP_UUID,session.callback),15)
     try:
         if value is not None: await session.write_command(15,encode_link_time(value))
         raw=await session.read_command(14)
@@ -61,7 +61,7 @@ async def clock(client, value=None):
     finally:
         import sys
         primary_error=sys.exc_info()[0] is not None
-        try: await asyncio.wait_for(client.stop_notify(protocol.UP_UUID),10)
+        try: await gatt_wait(client.stop_notify(protocol.UP_UUID),10)
         except Exception:
             if not primary_error: raise
 
@@ -123,8 +123,7 @@ async def inspect(client, *, stable=None, clock_read=None):
             result[name] = stable[name]
             continue
         try:
-            import asyncio
-            raw = bytes(await asyncio.wait_for(client.read_gatt_char(characteristic), 15))
+            raw = bytes(await gatt_wait(client.read_gatt_char(characteristic), 15))
             result[name] = decode(raw)
             if name == 'settings': result['settings_raw_hex'] = raw.hex()
         except (BleakError, ValueError, UnicodeError, TimeoutError, IndexError) as exc:
@@ -144,20 +143,19 @@ async def apply(client, changes, before):
     changes = validate_changes(changes)
     if before.get('settings') is None and any(k in changes for k in ('interval_seconds','wrap','update_seconds','reference_altitude_m')):
         raise TransferError('未读到设备当前设置，拒绝覆盖')
-    import asyncio
     async def write(characteristic, payload):
-        await asyncio.wait_for(client.write_gatt_char(characteristic, payload, response=True), 15)
+        await gatt_wait(client.write_gatt_char(characteristic, payload, response=True), 15)
     if any(k in changes for k in ('interval_seconds','wrap','update_seconds','reference_altitude_m')):
         payload = settings_payload(bytes.fromhex(before['settings_raw_hex']), changes)
         await write(SETTINGS_UUID, payload)
-        actual_raw=bytes(await asyncio.wait_for(client.read_gatt_char(SETTINGS_UUID),15))
+        actual_raw=bytes(await gatt_wait(client.read_gatt_char(SETTINGS_UUID),15))
         actual = decode_settings(actual_raw)
         for field in changes.keys() & actual.keys():
             if actual[field] != changes[field]: raise TransferError(f'{field} 写入后回读不一致；请重新读取，不自动重试')
         if actual_raw!=payload: raise TransferError('设置中未选择的字节发生变化；请重新读取核对')
     if 'name' in changes:
         await write(NAME_UUID, changes['name'].encode('ascii').ljust(20, b'\0'))
-        actual = bytes(await asyncio.wait_for(client.read_gatt_char(NAME_UUID), 15)).rstrip(b'\0').decode('ascii')
+        actual = bytes(await gatt_wait(client.read_gatt_char(NAME_UUID), 15)).rstrip(b'\0').decode('ascii')
         if actual != changes['name']: raise TransferError('设备名称写入后回读不一致')
     clock_read = None
     if 'time' in changes:
@@ -184,11 +182,10 @@ MEASUREMENTS = (
 
 async def live(client):
     from bleak.exc import BleakError
-    import asyncio
     values, status, errors = {}, {}, {}
     for field, code, width, signed, divisor in MEASUREMENTS:
         try:
-            raw = bytes(await asyncio.wait_for(client.read_gatt_char(uuid(code)), 10))
+            raw = bytes(await gatt_wait(client.read_gatt_char(uuid(code)), 10))
             if len(raw) != width+1: raise ValueError('实时测量长度与官方格式不一致')
             status[field] = {'present': bool(raw[0]&1), 'enabled':bool(raw[0]&2), 'valid':bool(raw[0]&4)}
             values[field] = int.from_bytes(raw[1:], 'little', signed=signed)/divisor if raw[0]&7==7 else None

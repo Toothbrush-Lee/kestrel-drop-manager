@@ -266,7 +266,7 @@ class Library:
                     try:
                         if blink:
                             payload=bytearray(20);payload[1]=1
-                            await asyncio.wait_for(client.write_gatt_char(control.COMMANDS_UUID,bytes(payload),response=True),15)
+                            await devices.gatt_wait(client.write_gatt_char(control.COMMANDS_UUID,bytes(payload),response=True),15)
                             after={'command_acknowledged':True,'visual_confirmation_required':True}
                         else: after=await control.apply(client,changes,before)
                         timings['write_verify'] = time.monotonic() - write_started

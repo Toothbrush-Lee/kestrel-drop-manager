@@ -220,3 +220,35 @@ with fake.patches(),patch.object(protocol,'resolve_ble_device',resolve):
                 info=manager.Library(data).database_info()
                 self.assertEqual(info['records'],0);self.assertEqual(info['devices'][0]['pending_records'],1)
             finally:job.close()
+
+
+class TransportCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_io_cannot_swallow_external_cancellation(self):
+        import asyncio
+        # Python 3.11 wait_for may return an already-completed inner task while
+        # swallowing cancellation of its caller. Direct timeout scopes must not.
+        for operation in ('send','next'):
+            with self.subTest(operation=operation):
+                task=None
+                async def completed_io(*args,**kwargs):
+                    asyncio.get_running_loop().call_soon(task.cancel)
+                    return protocol.Frame(4,b'\xff\xff',b'')
+                client=SimpleNamespace(write_gatt_char=completed_io)
+                session=protocol.BleSession(client,model='D1')
+                session.queue=SimpleNamespace(get=completed_io)
+                async def transfer():
+                    if operation=='send':await session.send(4,b'\xff\xff')
+                    else:await session.next()
+                    await asyncio.sleep(0)
+                task=asyncio.create_task(transfer())
+                with self.assertRaises(asyncio.CancelledError):await task
+
+    async def test_gatt_deadline_cancels_inner_io_and_runs_cleanup(self):
+        import asyncio
+        from kestrel_drop.devices import gatt_wait
+        closed=[]
+        async def blocked():
+            try:await asyncio.sleep(30)
+            finally:closed.append(True)
+        with self.assertRaises(TimeoutError):await gatt_wait(blocked(),timeout=.001)
+        self.assertEqual(closed,[True])

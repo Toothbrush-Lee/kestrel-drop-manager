@@ -60,6 +60,12 @@ def advertisement(device, adv):
             'identification_supported': True}
 
 
+async def gatt_wait(operation, timeout=15):
+    """Bound an I/O await without swallowing its caller's cancellation on 3.11."""
+    async with asyncio.timeout(timeout):
+        return await operation
+
+
 async def ble_call(operation, *args, **kwargs):
     from bleak.exc import BleakError
     try:
@@ -158,7 +164,7 @@ async def read_identity(client, *, ble_id=None):
     values, errors = {}, {}
     for key, characteristic in (('model', MODEL_UUID), ('serial', SERIAL_UUID)):
         try:
-            raw = await asyncio.wait_for(client.read_gatt_char(characteristic), timeout=15)
+            raw = await gatt_wait(client.read_gatt_char(characteristic), timeout=15)
             text = bytes(raw).decode('utf-8', 'strict').strip('\x00 ').strip()
             if not text or '\x00' in text: raise ValueError('字段为空或包含内嵌空字节')
             values[key] = serial_number(text) if key == 'serial' else text
