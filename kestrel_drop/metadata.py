@@ -14,7 +14,7 @@ def clean(value,key):
     value=value.strip()
     maximum=32 if key=='management_code' else 64
     if value and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,'+str(maximum-1)+'}',value):
-        raise ValueError(f'编号须以字母或数字开始，只含字母、数字、下划线、点、短横线，最多{maximum}字符；留空可清除')
+        raise ValueError(f'编号须以字母或数字开始，只含字母、数字、下划线、点、短横线，最多{maximum}字符；留空表示未填写')
     return value.upper() if key=='management_code' else value
 
 
@@ -36,6 +36,8 @@ def label_plan(store,path):
         if re.match(r'^D[123]-',code) and code[:2]!=model_type(known[serial]['model']):raise ValueError(f'设备 {serial} 管理编号型号前缀不符')
         if row.get('型号') and model_type(row['型号'])!=model_type(known[serial]['model']):raise ValueError(f'设备 {serial} 型号与数据库不一致')
         if row.get('编号') and row['编号'].strip().upper()!=f'{code}-{serial}':raise ValueError(f'设备 {serial} 组合编号不一致')
+        if known[serial]['management_code'] and known[serial]['management_code']!=code:
+            raise ValueError(f"设备 {serial} 的管理编号 {known[serial]['management_code']} 已锁定，CSV不能重新编号")
         fields={'management_code':code}
         # A labels-only import never silently clears an existing participant assignment.
         if (row.get('受试者代号') or '').strip():fields['participant_code']=clean(row['受试者代号'],'participant_code')
@@ -43,7 +45,7 @@ def label_plan(store,path):
     for serial,fields in updates:
         for other,item in known.items():
             if other!=serial and item.get('management_code')==fields['management_code']:
-                raise ValueError(f"管理编号 {fields['management_code']} 已被 {other} 占用；请先解除旧编号")
+                raise ValueError(f"管理编号 {fields['management_code']} 已被 {other} 占用；已有标签不可转给其他设备")
     return updates
 
 

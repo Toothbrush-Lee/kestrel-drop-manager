@@ -1,6 +1,6 @@
 # 命令参考
 
-适用于 0.14.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
+适用于 0.14.1。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
 
 ## 基本约定
 
@@ -165,4 +165,4 @@ uv run --extra viewer kestrel.py --data-dir /绝对路径/数据目录 browse --
 
 ## 本地设备资料与领用清单
 
-`metadata 序列号 [--management-code 管理编号] [--participant-code 受试者代号]`：无修改参数时只读，带参数离线保存，显式空字符串清除。`labels-import CSV路径` 只预览校验，加 `--execute` 原子导入已登记设备的编号；空白受试者列不覆盖已有代号。`labels-export 输出CSV路径` 导出当前资料清单，不覆盖旧文件。`actions 序列号` 可查看含 `requested.local_metadata` 的变更记录。完整规则见[设备资料](device-metadata.md)，当前代号不代表全部历史归属。
+`metadata 序列号 [--management-code 管理编号] [--participant-code 受试者代号]`：无修改参数时只读，带参数离线保存，显式空字符串仅清除受试者代号；管理编号首次保存后锁定，只允许相同值重传。`labels-import CSV路径` 只预览校验，加 `--execute` 原子导入已登记设备的编号；空白受试者列不覆盖已有代号。`labels-export 输出CSV路径` 导出当前资料清单，不覆盖旧文件。`actions 序列号` 可查看含 `requested.local_metadata` 的变更记录。完整规则见[设备资料](device-metadata.md)，当前代号不代表全部历史归属。

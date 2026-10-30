@@ -296,6 +296,8 @@ class Store:
                 if expected and serial in expected and any(before[key]!=value for key,value in expected[serial].items()):
                     raise ValueError('资料已被其他操作更新，请刷新本地列表后重新编辑')
                 after={**before,**fields}
+                if before['management_code'] and after['management_code']!=before['management_code']:
+                    raise ValueError(f"设备 {serial} 的管理编号 {before['management_code']} 已锁定，不能修改或清除已贴标签的对应关系")
                 if after==before:continue
                 owner=c.execute("SELECT serial FROM devices WHERE management_code=? AND management_code<>'' AND serial<>?",(after['management_code'],serial)).fetchone()
                 if owner:raise ValueError(f"管理编号 {after['management_code']} 已被 {owner['serial']} 占用")

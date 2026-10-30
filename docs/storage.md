@@ -102,3 +102,5 @@ status 的 pending_records 是当前 receiving/interrupted 尝试的记录数；
 资料更新与 `device_actions` 审计在同一个事务中完成，`requested.local_metadata` 区分本地资料操作与设备配置。before/after保存旧新值，UTC记录操作时刻；同值不新增审计。它记录登记操作时间，不能代替实际佩戴或观测时段。不会在observations上重复存代号，也不按当前devices关联改写旧数据。
 
 4→5首次写入前创建 `backups/schema4-before-upgrade-*.sqlite` 独立备份，完整检查后，在一个事务中添加列、部分唯一索引与更新视图。DDL失败不留下半套字段。2/3先按历史流程到4（保存原版本备份），再完成资料升级。只读兼容2/3/4/5，旧版程序无法打开5。
+
+0.14.1起，资料更新事务拒绝改变或清空已有非空management_code，CSV预览亦核对固定映射；受试者代号不受此锁定限制。新登记设备保持管理编号空白，首次赋号后固定，无全表重排逻辑。schema仍为5，现有编号不需迁移或重写。

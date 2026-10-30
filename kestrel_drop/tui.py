@@ -293,7 +293,14 @@ class Terminal:
         if not device or not device.get('serial') or not device.get('database'):
             self.message='请先按 x 核验登记此设备，再填写本地资料'
             return
-        self.open_form(f"本地资料 · 序列号 {device['serial']}", [('管理编号（可空）',device.get('management_code','')),('当前受试者代号（可空）',device.get('participant_code',''))],'metadata')
+        fields=[('当前受试者代号（可空）',device.get('participant_code',''))]
+        keys=['participant_code']
+        code=device.get('management_code','')
+        if not code:
+            fields.insert(0,('首次管理编号（保存后锁定）',''));keys.insert(0,'management_code')
+        title=f"本地资料 · {code+'（已锁定） · ' if code else ''}{device['serial']}"
+        self.open_form(title,fields,'metadata')
+        self.form['metadata_keys']=keys
         self.form['target']=device['serial'];self.form['before']=dict(device)
 
     def submit(self):
@@ -316,8 +323,9 @@ class Terminal:
                 if self.start('timing',['timing',self.form['target'],'--interval',str(interval)]) is False:return
             elif action=='metadata':
                 from .metadata import clean
-                fields={key:clean(value,key) for key,value in zip(('management_code','participant_code'),values)}
                 old=self.form['before']
+                fields={key:old.get(key,'') for key in ('management_code','participant_code')}
+                fields.update({key:clean(value,key) for key,value in zip(self.form['metadata_keys'],values)})
                 self.review={'action':'metadata','serial':self.form['target'],'label':'本地管理编号 / 当前受试者代号',
                     'old':f"{old.get('management_code') or '未编号'} / {old.get('participant_code') or '未分配'}",
                     'new':f"{fields['management_code'] or '未编号'} / {fields['participant_code'] or '未分配'}",
@@ -854,7 +862,7 @@ class Terminal:
             'set_name':'仅支持1–20个可打印ASCII字符，如 Lab-01；真实设备编号不会改变。',
             'set_update':'范围2–60秒，影响实时刷新，与历史采样间隔分开。',
             'set_altitude':'单位为米，可为负值；只用于气压计算，不改出厂校准。',
-            'metadata':'字母数字开头，可含 _ . -；管理编号最多32字符、受试者代号64字符。留空会清除当前值；不填真实姓名。',
+            'metadata':'已有管理编号与序列号固定，不可修改或清空。新设备首次填写编号，保存后锁定。受试者代号可修改或清空；不填真实姓名。',
             'export':'不筛选时间可直接按 Enter 跳过；结束日期包含当天整天。'}
         start=4+min(count,len(form['fields']))*3
         for row,line in enumerate(wrap_lines(help_text.get(form['action'],''),width-3),start):

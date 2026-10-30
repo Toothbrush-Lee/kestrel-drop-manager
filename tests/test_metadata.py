@@ -182,3 +182,51 @@ class MetadataTests(unittest.TestCase):
         t=Terminal(Screen(),self.library);t.devices={item['serial']:item for item in self.library.status()}
         t.device_state={'serial':'999'};t.handle('z')
         self.assertIsNone(t.form);self.assertIn('核验登记',t.message)
+
+    def test_assigned_label_cannot_be_changed_cleared_or_stolen(self):
+        self.library.metadata('2',management_code='D1-001',participant_code='P01')
+        for replacement in ('D1-099',''):
+            with self.assertRaisesRegex(ValueError,'已锁定'):
+                self.library.metadata('2',management_code=replacement,participant_code='P02')
+        self.assertEqual(self.library.metadata('2')['participant_code'],'P01')
+        self.assertEqual(len(self.store.actions('2')),1)
+        self.library.metadata('2',participant_code='P02')
+        self.library.metadata('2',participant_code='')
+        self.assertEqual(self.library.metadata('2')['management_code'],'D1-001')
+
+    def test_new_devices_and_re_registration_never_renumber_old_labels(self):
+        self.library.metadata('2',management_code='D1-001')
+        self.library.metadata('2866855',management_code='D3-043')
+        original={r['serial']:r['management_code'] for r in self.library.status()}
+        for serial,kind,code in [('1','D2','D2-044'),('9999999','D1','D1-045')]:
+            self.store.register_device(serial,kind)
+            self.assertEqual(self.library.metadata(serial)['management_code'],'')
+            self.library.metadata(serial,management_code=code)
+        self.store.register_device('2','D1')
+        for serial,code in original.items():self.assertEqual(self.library.metadata(serial)['management_code'],code)
+
+    def test_reimport_is_idempotent_and_reordered_sheet_cannot_remap_labels(self):
+        self.library.metadata('2',management_code='D1-001')
+        self.library.metadata('2866855',management_code='D3-043')
+        path=self.sheet([['D3-043-2866855','D3-043','2866855','Kestrel DROP 3',''],['D1-001-2','D1-001','2','Kestrel DROP 1','']])
+        self.assertEqual(self.library.import_labels(path,execute=True)['updated'],0)
+        path=self.sheet([['D1-002-2','D1-002','2','Kestrel DROP 1','']])
+        for execute in (False,True):
+            with self.assertRaisesRegex(ValueError,'已锁定'):self.library.import_labels(path,execute=execute)
+        self.assertEqual(self.library.metadata('2')['management_code'],'D1-001')
+
+    def test_locked_label_is_readonly_in_tui_but_participant_remains_editable(self):
+        self.library.metadata('2',management_code='D1-001',participant_code='P01')
+        t=Terminal(Screen(),self.library);t.devices={'2':self.library.metadata('2')}
+        t.handle('z');self.assertEqual(t.form['metadata_keys'],['participant_code'])
+        self.assertEqual(len(t.form['fields']),1)
+        self.assertIn('已锁定',t.form['title'])
+        t.form['fields'][0][1]='P02';t.submit()
+        self.assertIn('D1-001 / P02',t.review['new'])
+
+    def test_locked_label_failure_rolls_back_other_device_changes_in_batch(self):
+        self.library.metadata('2866855',management_code='D3-043')
+        with self.assertRaisesRegex(ValueError,'已锁定'):
+            self.store.update_metadata([('2',{'participant_code':'P01'}),('2866855',{'management_code':'D3-044'})])
+        self.assertEqual(self.library.metadata('2')['participant_code'],'')
+        self.assertEqual(self.library.metadata('2866855')['management_code'],'D3-043')
