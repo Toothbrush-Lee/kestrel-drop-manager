@@ -59,7 +59,7 @@ class DatabaseTests(unittest.TestCase):
     def test_typed_schema_has_no_duplicate_json_or_csv_authority(self):
         with self.library.store.connect() as c:
             tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            self.assertEqual(tables, {'devices','histories','transfers','pending_blocks','observations','device_actions'})
+            self.assertEqual(tables, {'devices','histories','transfers','pending_blocks','observations','device_actions','device_preferences'})
             self.assertNotIn('row_json', {r[1] for r in c.execute('PRAGMA table_info(observations)')})
         self.assertFalse(list(self.library.root.rglob('*.csv')))
         self.assertEqual(self.library.database_info()['records'], 3)

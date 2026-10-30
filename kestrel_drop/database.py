@@ -1,4 +1,4 @@
-"""Single durable authority for observations and BLE recovery (schema 5).
+"""Single durable authority for observations and BLE recovery (schema 6).
 
 Block transactions commit before ACK. Final publication, cursor advancement and
 pending cleanup are one transaction. Read operations never repair or reindex.
@@ -22,7 +22,7 @@ from .errors import MigrationRequired
 from .devices import canonical_model, model_type, capabilities, serial_number
 from .layouts import MEASUREMENTS, FIELDS, profile
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 APPLICATION_ID = 0x4B445250
 DECODER = 'd3-21-v2'
 
@@ -62,6 +62,9 @@ SCHEMA = (
         before_json TEXT NOT NULL, after_json TEXT, error TEXT,
         status TEXT NOT NULL CHECK(status IN ('started','verified','failed_or_unknown')))''',
     "CREATE UNIQUE INDEX devices_management_code ON devices(management_code) WHERE management_code<>''",
+    '''CREATE TABLE device_preferences (
+        serial TEXT PRIMARY KEY REFERENCES devices(serial),
+        auto_sync INTEGER NOT NULL DEFAULT 0 CHECK(auto_sync IN (0,1)))''',
     '''CREATE VIEW device_overview AS
         SELECT d.serial,d.model,d.alias,d.management_code,d.participant_code,h.generation,h.first_cursor,h.next_cursor,
         (SELECT count(*) FROM observations o WHERE o.history_id=h.id) AS records,
@@ -132,6 +135,9 @@ class Store:
                 if connection.execute('PRAGMA user_version').fetchone()[0] == 4:
                     self._check_schema(connection)
                     self._upgrade_metadata(connection,backup=version not in (2,3))
+                if connection.execute('PRAGMA user_version').fetchone()[0] == 5:
+                    self._check_schema(connection)
+                    self._upgrade_preferences(connection,backup=version==5)
                 if version == 0:
                     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone():
                         raise RuntimeError('数据库格式不受支持，拒绝覆盖')
@@ -151,7 +157,7 @@ class Store:
         with self.connect() as connection:
             if connection.execute('PRAGMA user_version').fetchone()[0] == 1:
                 raise MigrationRequired('旧版 SQLite 需要运行 migrate；文件未被覆盖')
-            if (connection.execute('PRAGMA user_version').fetchone()[0] not in (2, 3, 4, SCHEMA_VERSION) or
+            if (connection.execute('PRAGMA user_version').fetchone()[0] not in (2, 3, 4, 5, SCHEMA_VERSION) or
                     connection.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID):
                 raise RuntimeError('数据库需要迁移或版本不受支持；旧版本请运行 migrate，文件未被覆盖')
 
@@ -194,6 +200,16 @@ class Store:
             connection.execute(SCHEMA_OBJECTS['device_overview'])
             connection.execute('PRAGMA user_version=5')
 
+    def _upgrade_preferences(self, connection, *, backup=True):
+        import uuid
+        if backup:
+            directory=self.path.parent/'backups';directory.mkdir(exist_ok=True)
+            Store(self.path).backup(directory/f'schema5-before-upgrade-{uuid.uuid4().hex[:12]}.sqlite')
+        with connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute(SCHEMA_OBJECTS['device_preferences'])
+            connection.execute('PRAGMA user_version=6')
+
     def _copy_v2_tables(self, connection):
         for name in ('pending_blocks', 'observations'):
             connection.execute(SCHEMA_OBJECTS[name].replace('CREATE TABLE ' + name, 'CREATE TABLE ' + name + '_v3', 1))
@@ -205,6 +221,7 @@ class Store:
     def _check_schema(self, connection):
         version = connection.execute('PRAGMA user_version').fetchone()[0]
         required = set(SCHEMA_OBJECTS)
+        if version<6:required.discard('device_preferences')
         if version<5:required.discard('devices_management_code')
         if version in (2, 3): required -= {'device_actions', 'device_overview'}
         actual = {row[1]: (row[0], row[2]) for row in connection.execute(
@@ -310,6 +327,56 @@ class Store:
                           (serial,stamp,stamp,json.dumps({'local_metadata':fields},ensure_ascii=False),json.dumps(before,ensure_ascii=False),json.dumps(after,ensure_ascii=False)))
                 changed.append(serial)
             return {'updated':len(changed),'serials':changed}
+
+    def preferences(self, serial):
+        with self.connect() as c:
+            if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='device_preferences'").fetchone():return {'auto_sync':False}
+            row=c.execute('SELECT auto_sync FROM device_preferences WHERE serial=?',(serial_number(serial),)).fetchone()
+            return {'auto_sync':bool(row[0]) if row else False}
+
+    def set_preferences(self, serial, *, auto_sync):
+        if type(auto_sync) is not bool:raise ValueError('自动同步须为开启或关闭')
+        with self.transaction() as c:
+            self._history(c,serial_number(serial))
+            row=c.execute('SELECT auto_sync FROM device_preferences WHERE serial=?',(serial,)).fetchone()
+            before={'auto_sync':bool(row[0]) if row else False}
+            after={'auto_sync':auto_sync}
+            if before!=after:
+                c.execute('INSERT INTO device_preferences(serial,auto_sync) VALUES(?,?) ON CONFLICT(serial) DO UPDATE SET auto_sync=excluded.auto_sync',(serial,int(auto_sync)))
+                stamp=utcnow()
+                c.execute("INSERT INTO device_actions(serial,started_utc,finished_utc,requested_json,before_json,after_json,status) VALUES(?,?,?,?,?,?,'verified')",
+                          (serial,stamp,stamp,json.dumps({'app_preferences':after}),json.dumps(before),json.dumps(after)))
+        return after
+
+    def data_info(self, serial):
+        with self.connect() as c:
+            c.execute('BEGIN');self._history(c,serial_number(serial))
+            identity=dict(c.execute('SELECT * FROM devices WHERE serial=?',(serial,)).fetchone())
+            identity.setdefault('management_code','');identity.setdefault('participant_code','')
+            histories=[tuple(r) for r in c.execute('SELECT id,generation,first_cursor,next_cursor FROM histories WHERE serial=? ORDER BY generation',(serial,))]
+            counts=dict(c.execute("SELECT count(*) AS records,(SELECT timestamp_device_local FROM observations JOIN histories h ON h.id=history_id WHERE h.serial=? ORDER BY h.generation DESC,absolute_cursor DESC LIMIT 1) AS last_record FROM observations o JOIN histories h ON h.id=o.history_id WHERE h.serial=?",(serial,serial)).fetchone())
+            pending=tuple(c.execute('SELECT count(*),coalesce(sum(length(payload)),0) FROM pending_blocks b JOIN transfers t ON t.id=b.transfer_id JOIN histories h ON h.id=t.history_id WHERE h.serial=?',(serial,)).fetchone())
+            revision=hashlib.sha256(json.dumps([identity,histories,counts,pending],sort_keys=True).encode()).hexdigest()
+        return {**identity,**counts,'pending_blocks':pending[0],'revision':revision,**self.preferences(serial)}
+
+    def clear_local_history(self, serial, *, backup, revision):
+        snapshot=Store(Path(backup))
+        if snapshot.path==self.path or snapshot.data_info(serial)['revision']!=revision:
+            raise ValueError('清除前必须提供与确认范围一致的独立备份')
+        with self.transaction() as c:
+            # Directory writer lock belongs to the caller. A snapshot revision prevents stale UI deletion.
+            before=self.data_info(serial)
+            if revision!=before['revision']:raise ValueError('本地档案已变化，请刷新数据管理页后重新确认')
+            generation=self._history(c,serial)['generation']+1
+            c.execute('DELETE FROM pending_blocks WHERE transfer_id IN (SELECT t.id FROM transfers t JOIN histories h ON h.id=t.history_id WHERE h.serial=?)',(serial,))
+            c.execute('DELETE FROM transfers WHERE history_id IN (SELECT id FROM histories WHERE serial=?)',(serial,))
+            c.execute('DELETE FROM observations WHERE history_id IN (SELECT id FROM histories WHERE serial=?)',(serial,))
+            c.execute('DELETE FROM histories WHERE serial=?',(serial,))
+            c.execute('INSERT INTO histories(serial,generation) VALUES(?,?)',(serial,generation))
+            stamp=utcnow()
+            c.execute("INSERT INTO device_actions(serial,started_utc,finished_utc,requested_json,before_json,after_json,status) VALUES(?,?,?,?,?,?,'verified')",
+                      (serial,stamp,stamp,json.dumps({'clear_local_history':True,'backup':str(backup)}),json.dumps(before),json.dumps({'records':0,'generation':generation})))
+        return {'serial':serial,'status':'cleared_local','records':0,'backup':str(backup),'generation':generation}
 
     def _pending(self, connection, history):
         return self._pending_state(connection, history, collect=True)

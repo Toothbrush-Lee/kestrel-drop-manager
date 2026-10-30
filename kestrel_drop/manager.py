@@ -44,6 +44,12 @@ async def discover(timeout=15, *, identify=False, register_to=None):
                 if register_to is not None:
                     register_to.save_identity(result)
                     item['registered'] = True
+                    if register_to.store.preferences(result['serial'])['auto_sync']:
+                        try:
+                            code=await register_to.download(result['serial'],ble_id=item['ble_id'],execute=True,discovery=snapshot)
+                            if code:raise RuntimeError('已登记，但连接后自动同步尚未完成')
+                            item['auto_synced']=True
+                        except (OSError,RuntimeError,ValueError) as sync_error:item['auto_sync_error']=str(sync_error)
             except (OSError, RuntimeError, ValueError) as exc:
                 item['identity_error'] = str(exc)
     return found
@@ -113,10 +119,20 @@ class Library:
             plan=label_plan(self.store,path);store=self._writable_store()
             return store.update_metadata(plan)
 
+    def data_preferences(self,serial,*,auto_sync=None):
+        serial=serial_number(serial)
+        self.store.device(serial)
+        if auto_sync is not None:
+            with writer_lock(self.root):self._writable_store().set_preferences(serial,auto_sync=auto_sync)
+        return self.store.data_info(serial)
+
     async def register(self, *, ble_id=None, serial=None, timeout=15):
         identity = await devices.identify(ble_id, serial=serial, timeout=timeout)
         devices.require_identity(identity, expected=serial)
         self.save_identity(identity)
+        if self.store.preferences(identity['serial'])['auto_sync']:
+            code=await self.download(identity['serial'],ble_id=identity['ble_id'],execute=True,timeout=timeout)
+            if code:raise RuntimeError('登记完成，但自动同步尚有未确认数据')
         return identity
 
     def save_identity(self, identity):
@@ -203,48 +219,52 @@ class Library:
                 events.emit('phase', serial=serial, phase='identifying')
                 identity = await devices.read_identity(client, ble_id=getattr(device, 'address', ble_id))
                 devices.require_identity(identity, expected=serial, history=True)
-                store.ensure_device(serial, devices.canonical_model(identity['model']))
-                cursor, pending = store.resume(serial)
-                session = protocol.BleSession(client, model=identity['model'])
-                await client.start_notify(protocol.UP_UUID, session.callback)
-                try:
-                    events.emit('phase', serial=serial, phase='querying')
-                    count = await session.query_count(cursor)
-                    if not count:
-                        return 3 if pending or any(d['pending_records'] or d.get('superseded_records') for d in store.status(serial)) else 0
-                    if count > maxrows:
-                        raise RuntimeError('设备报告的记录数超过 --maxrows；可能存在历史缺口，未继续读取')
-                    transfer_id = store.begin_transfer(serial, cursor, count)
-                    progress = (progress_factory or (lambda n: protocol.TransferProgress(n, log_seconds=0.5)))(count)
-                    started = time.monotonic()
-                    try:
-                        events.emit('phase', serial=serial, phase='receiving')
-                        def complete(rows, blocks, final):
-                            events.emit('phase', serial=serial, phase='verifying')
-                            events.emit('phase', serial=serial, phase='saving')
-                            store.finish_transfer(transfer_id, next_cursor=final, elapsed_seconds=time.monotonic()-started,
-                                                  maxrows=maxrows, received_rows=rows)
-                        await session.download_from_cursor(cursor, count, maxrows, progress=progress,
-                            on_block=lambda rows, blocks: store.append_block(transfer_id, rows, blocks), on_complete=complete)
-                        progress.finish(success=True)
-                    except CompletionAckFailure:
-                        progress.finish(success=True)
-                        raise
-                    except BaseException:
-                        progress.finish(success=False, partial_saved=True)
-                        raise
-                    return 0
-                finally:
-                    primary_error=sys.exc_info()[0] is not None
-                    try: await client.stop_notify(protocol.UP_UUID)
-                    except Exception:
-                        if not primary_error: raise
+                return await self._sync_client(client,store,identity,maxrows=maxrows,progress_factory=progress_factory)
         warning = None
         try:
             result = await _ble_call(connected)
         except CompletionAckFailure as exc:
             result, warning = 0, describe(exc)
         return self.complete_download(serial, previous=before, code=result, warning=warning)
+
+    async def _sync_client(self, client, store, identity, *, maxrows=20000, progress_factory=None):
+        serial=identity['serial']
+        store.ensure_device(serial, devices.canonical_model(identity['model']))
+        cursor, pending = store.resume(serial)
+        session = protocol.BleSession(client, model=identity['model'])
+        await client.start_notify(protocol.UP_UUID, session.callback)
+        try:
+            events.emit('phase', serial=serial, phase='querying')
+            count = await session.query_count(cursor)
+            if not count:
+                return 3 if pending or any(d['pending_records'] or d.get('superseded_records') for d in store.status(serial)) else 0
+            if count > maxrows:
+                raise RuntimeError('设备报告的记录数超过 --maxrows；可能存在历史缺口，未继续读取')
+            transfer_id = store.begin_transfer(serial, cursor, count)
+            progress = (progress_factory or (lambda n: protocol.TransferProgress(n, log_seconds=0.5)))(count)
+            started = time.monotonic()
+            try:
+                events.emit('phase', serial=serial, phase='receiving')
+                def complete(rows, blocks, final):
+                    events.emit('phase', serial=serial, phase='verifying')
+                    events.emit('phase', serial=serial, phase='saving')
+                    store.finish_transfer(transfer_id, next_cursor=final, elapsed_seconds=time.monotonic()-started,
+                                          maxrows=maxrows, received_rows=rows)
+                await session.download_from_cursor(cursor, count, maxrows, progress=progress,
+                    on_block=lambda rows, blocks: store.append_block(transfer_id, rows, blocks), on_complete=complete)
+                progress.finish(success=True)
+            except CompletionAckFailure:
+                progress.finish(success=True)
+                raise
+            except BaseException:
+                progress.finish(success=False, partial_saved=True)
+                raise
+            return 0
+        finally:
+            primary_error=sys.exc_info()[0] is not None
+            try: await client.stop_notify(protocol.UP_UUID)
+            except Exception:
+                if not primary_error: raise
 
     async def device_operation(self, serial, *, ble_id=None, timeout=20, changes=None, execute=False, blink=False, samples=0, period=2, allow_schedule_shift=False):
         from . import control
@@ -275,6 +295,13 @@ class Library:
                     identity = await devices.read_identity(client,ble_id=device.address)
                     devices.require_identity(identity,expected=serial)
                     timings['identity'] = time.monotonic() - identity_started
+                    auto_synced=False
+                    if self.database_path.exists() and self.store.preferences(serial)['auto_sync']:
+                        devices.require_identity(identity,expected=serial,history=True)
+                        events.emit('phase',serial=serial,phase='auto_sync')
+                        code=await self._sync_client(client,self._writable_store(),identity)
+                        if code:raise RuntimeError('自动同步尚有未确认数据，未继续设备操作；请先手动同步')
+                        auto_synced=True
                     if changes and 'reference_altitude_m' in changes and identity['device_type']!='D3':
                         raise ValueError('参考海拔用于 D3 气压计算，此型号不适用；未发送设置指令')
                     if samples:
@@ -283,11 +310,12 @@ class Library:
                             sample={'serial':serial,**await control.live(client)}
                             events.emit('sample',**sample);values.append(sample)
                             if index+1 < samples: await asyncio.sleep(period)
-                        return {'serial':serial,'samples':values,'stored':False}
+                        return {'serial':serial,'samples':values,'stored':False,'auto_synced':auto_synced}
                     read_started = time.monotonic()
+                    events.emit('phase',serial=serial,phase='reading_settings')
                     before=await control.inspect(client)
                     timings['read_before'] = time.monotonic() - read_started
-                    result={**identity,**before}
+                    result={**identity,**before,'auto_synced':auto_synced}
                     if changes is None and not blink: return result
                     audit_started = time.monotonic()
                     store=self._writable_store()
@@ -305,7 +333,7 @@ class Library:
                         audit_started = time.monotonic()
                         store.finish_action(action,after=after)
                         timings['audit'] += time.monotonic() - audit_started
-                        return {'serial':serial,'status':'verified','action_id':action,'before':result,'after':after}
+                        return {'serial':serial,'status':'verified','action_id':action,'before':result,'after':after,'auto_synced':auto_synced}
                     except BaseException as exc:
                         store.finish_action(action,error=f'{type(exc).__name__}: {exc}; device may have changed; read back before retry')
                         if isinstance(exc, asyncio.CancelledError): raise
@@ -370,6 +398,21 @@ def parser():
     ap.add_argument('--events-json', action='store_true', help='输出版本化 JSON Lines 事件，供 TUI / 自动化使用')
     sub = ap.add_subparsers(dest='command')
     sub.add_parser('tui', help='交互式终端界面')
+    count=sub.add_parser('device-count',help='仅核验身份并读取设备日志条数，不触发自动同步或清除')
+    count.add_argument('serial',type=serial_number);count.add_argument('--ble-id');count.add_argument('--timeout',type=float,default=20)
+    info=sub.add_parser('data-info',help='本机单设备数据管理摘要，不连接蓝牙')
+    info.add_argument('serial',type=serial_number)
+    pref=sub.add_parser('data-preferences',help='设置本机连接后自动同步；不改变设备采样')
+    pref.add_argument('serial',type=serial_number)
+    pref.add_argument('--auto-sync',choices=('on','off'))
+    for command,title in (('clear-history','清除本机设备历史；自动备份，保留设备资料'),('erase-device','清除设备内部日志；先同步并备份，保留电脑历史')):
+        clear=sub.add_parser(command,help=title)
+        clear.add_argument('serial',type=serial_number)
+        clear.add_argument('--execute',action='store_true')
+        clear.add_argument('--confirm-serial')
+        clear.add_argument('--expected-revision')
+        if command=='erase-device':
+            clear.add_argument('--ble-id');clear.add_argument('--timeout',type=float,default=20)
     metadata=sub.add_parser('metadata',help='查看或保存本地管理编号和当前受试者代号；不连接设备')
     metadata.add_argument('serial',type=serial_number)
     metadata.add_argument('--management-code',default=None)
@@ -492,9 +535,10 @@ def _run(args):
             return run(library)
         if args.command == 'scan':
             result = asyncio.run(discover(args.timeout, identify=args.identify, register_to=library if args.register else None))
-            if (args.identify or args.register) and any(item.get('identity_error') or not item.get('identity_verified') for item in result):
+            if (args.identify or args.register) and any(item.get('identity_error') or item.get('auto_sync_error') or not item.get('identity_verified') for item in result):
                 from .errors import DeviceMismatch
                 for item in result:
+                    if item.get('auto_sync_error'):events.emit('error',serial=item['serial'],**describe(RuntimeError('身份已登记，但自动同步失败：'+item['auto_sync_error'])))
                     if item.get('identity_error') or not item.get('identity_verified'):
                         events.emit('error', serial=item.get('serial'), ble_id=item['ble_id'],
                             **describe(DeviceMismatch(item.get('identity_error') or str(item.get('identity_errors')))))
@@ -507,6 +551,18 @@ def _run(args):
                 events.emit('error', **describe(DeviceMismatch('设备型号或编号读取未通过核验：' + str(result['identity_errors']))))
                 events.result(result)
                 return 2
+        elif args.command=='device-count':
+            from .data_management import device_count
+            result=asyncio.run(device_count(library,args.serial,ble_id=args.ble_id,timeout=args.timeout))
+        elif args.command=='data-info':
+            result=library.store.data_info(args.serial)
+        elif args.command=='data-preferences':
+            result=library.data_preferences(args.serial,auto_sync=None if args.auto_sync is None else args.auto_sync=='on')
+        elif args.command in ('clear-history','erase-device'):
+            from .data_management import local_history,erase_device
+            values=dict(execute=args.execute,confirmation=args.confirm_serial,revision=args.expected_revision)
+            result=(local_history(library,args.serial,**values) if args.command=='clear-history' else
+                    asyncio.run(erase_device(library,args.serial,ble_id=args.ble_id,timeout=args.timeout,**values)))
         elif args.command=='metadata':
             fields={key:getattr(args,key) for key in ('management_code','participant_code') if getattr(args,key) is not None}
             expected={key:getattr(args,'expect_'+key) for key in ('management_code','participant_code') if getattr(args,'expect_'+key) is not None}

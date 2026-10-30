@@ -1,6 +1,6 @@
 # 命令参考
 
-适用于 0.14.1。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
+适用于 0.15.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
 
 ## 基本约定
 
@@ -166,3 +166,20 @@ uv run --extra viewer kestrel.py --data-dir /绝对路径/数据目录 browse --
 ## 本地设备资料与领用清单
 
 `metadata 序列号 [--management-code 管理编号] [--participant-code 受试者代号]`：无修改参数时只读，带参数离线保存，显式空字符串仅清除受试者代号；管理编号首次保存后锁定，只允许相同值重传。`labels-import CSV路径` 只预览校验，加 `--execute` 原子导入已登记设备的编号；空白受试者列不覆盖已有代号。`labels-export 输出CSV路径` 导出当前资料清单，不覆盖旧文件。`actions 序列号` 可查看含 `requested.local_metadata` 的变更记录。完整规则见[设备资料](device-metadata.md)，当前代号不代表全部历史归属。
+
+## 单台数据管理
+
+```sh
+uv run kestrel.py data-info 序列号
+uv run kestrel.py data-preferences 序列号 --auto-sync on
+uv run kestrel.py data-preferences 序列号 --auto-sync off
+uv run kestrel.py device-count 序列号
+uv run kestrel.py clear-history 序列号
+uv run kestrel.py erase-device 序列号
+```
+
+data-info和偏好设置不连接蓝牙；自动同步默认关闭。device-count只核验硬件身份和读取总日志条数，不触发自动同步、清除或校时。设备设置读取、配置、闪灯、实时读取及明确登记连接在启用偏好后先同步一次；纯扫描和只读identify不触发。
+
+两种清除默认预演，不清数据。实际执行必须同时传 `--execute --confirm-serial 完整序列号 --expected-revision 刚读取的data-info.revision`；不支持all/serials。revision防止确认后数据或领用信息变化。clear-history会先生成独立备份再清除本机该设备全部正式记录、暂存和传输历史；erase-device先同步、备份再使用官方命令1清设备日志，并用命令2核对0条，电脑历史与游标保留。备份失败或数据有未确认项时不清除；结果不明不得直接重试。建议普通用户使用h页的输入确认流程。erase-device和device-count支持--ble-id、--timeout。
+
+清除范围、自动同步的短连接行为和采集中清设备的边界详见[数据管理指南](data-management.md)。

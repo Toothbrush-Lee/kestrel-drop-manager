@@ -1,6 +1,6 @@
 # 开发与维护规范
 
-当前版本 0.14.1，SQLite schema 5。用户操作见[用户手册](user-guide.md)，命令见[CLI](cli.md)。本规范用于后续迭代，避免代码、观测和研究材料重新混杂。
+当前版本 0.15.0，SQLite schema 6。用户操作见[用户手册](user-guide.md)，命令见[CLI](cli.md)。本规范用于后续迭代，避免代码、观测和研究材料重新混杂。
 
 ## 目录职责
 
@@ -80,3 +80,5 @@ git log --oneline -8
 基础静态检查使用 `uv run --locked --group lint ruff check .`；lint 依赖独立分组，普通用户启动不安装。CI 同时覆盖发布使用的 Python 3.13。BleSession 必须显式传型号；旧 CSV 诊断仅通过 LegacyBleSession 使用旧方言，不能作为新采集功能入口。
 
 本地设备资料由 `metadata.py` 校验输入和CSV映射，`database.py` 在同一个事务内更新 devices 与 device_actions，TUI通过标准worker调用metadata命令。管理编号不参与BLE身份或下载寻址；当前受试者代号不得拼接到历史观测导出或自动用于归属推断。真实编号清单、代号和数据库只放已忽略的本地数据目录，不能加入测试夹具或Git。
+
+`data_management.py`负责单设备本机历史清除与设备擦除编排，强制确认、版本戳、独立备份；传输复用Library._sync_client，不建立第二套下载器。自动同步偏好存在device_preferences而非用户配置文件。数据管理UI只通过worker命令调用，不能直接在curses线程操作BLE或删除记录。device-count为恢复诊断保留独立只读路径，不隐式自动同步。

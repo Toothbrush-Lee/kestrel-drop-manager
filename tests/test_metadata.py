@@ -92,7 +92,7 @@ class MetadataTests(unittest.TestCase):
         before=self.library.database_path.read_bytes();self.assertEqual(old.status()[0]['management_code'],'');old.check()
         self.assertEqual(before,self.library.database_path.read_bytes())
         self.assertEqual(Browser(self.library.root).catalog()[0]['participant_code'],'')
-        result=storage.migrate(self.library.root);self.assertEqual(result['schema_version'],5)
+        result=storage.migrate(self.library.root);self.assertEqual(result['schema_version'],6)
         backups=list((self.library.root/'backups').glob('schema4-before-upgrade-*.sqlite'))
         self.assertEqual(len(backups),1);self.assertEqual(Store(backups[0]).check()['schema_version'],4)
         self.assertEqual(Store(self.library.database_path).query('2866855'),original)

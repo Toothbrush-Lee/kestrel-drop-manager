@@ -1,4 +1,4 @@
-# 存储设计：schema 5 / 0.14.0
+# 存储设计：schema 6 / 0.15.0
 
 SQLite 是运行时唯一权威来源。CSV 仅作导出或旧档案导入；旧格式恢复代码只在迁移副本及底层诊断工具中使用。
 
@@ -104,3 +104,11 @@ status 的 pending_records 是当前 receiving/interrupted 尝试的记录数；
 4→5首次写入前创建 `backups/schema4-before-upgrade-*.sqlite` 独立备份，完整检查后，在一个事务中添加列、部分唯一索引与更新视图。DDL失败不留下半套字段。2/3先按历史流程到4（保存原版本备份），再完成资料升级。只读兼容2/3/4/5，旧版程序无法打开5。
 
 0.14.1起，资料更新事务拒绝改变或清空已有非空management_code，CSV预览亦核对固定映射；受试者代号不受此锁定限制。新登记设备保持管理编号空白，首次赋号后固定，无全表重排逻辑。schema仍为5，现有编号不需迁移或重写。
+
+## schema 6 应用偏好与清除事务
+
+新增device_preferences(serial主键/FK, auto_sync布尔)，默认缺省为关闭。同值不新增审计，变更在device_actions.requested.app_preferences中记录。5→6先完整备份为schema5-before-upgrade-*.sqlite，再在一个事务里新增偏好表，不更新原始观测或资料。旧版2/3/4/5保持只读兼容。
+
+Clear Device History只删除指定serial全部历史段下的observations、pending_blocks、transfers和histories，随后以更大的generation新建空历史；devices、device_preferences及device_actions均保留。先备份并核对revision，删除与本地清除审计同事务提交；下次从游标0重新读取设备仍保留的日志。
+
+Clear Device Log仅操作设备flash：复用完整下载事务同步可读取增量、建立独立备份、保存started审计，然后发送命令1并读取命令2确认0条。电脑已提交观测及其游标不删除、不归零；按官方生命周期序号继续增量。失败或取消写failed_or_unknown；审计存储失败时仍报结果不确定，不重复擦除。两个清除入口互不调用，均不提供批量或自动触发。

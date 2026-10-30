@@ -52,6 +52,24 @@ def validate_result(action, data):
             raise ValueError('invalid list result')
     elif not isinstance(data,dict):
         raise ValueError('invalid object result')
+    if action in ('data-info','data-preferences','device-count','clear-history','erase-device'):
+        if not isinstance(data.get('serial'),str):raise ValueError('missing data-management serial')
+        def count(key):
+            if type(data.get(key)) is not int or data[key]<0:raise ValueError('invalid data-management count')
+        if action in ('data-info','data-preferences'):
+            count('records');count('pending_blocks')
+            if type(data.get('auto_sync')) is not bool or not isinstance(data.get('revision'),str) or len(data['revision'])!=64:
+                raise ValueError('invalid data-management snapshot')
+        elif action=='device-count':
+            count('device_records')
+            if data.get('read_only') is not True:raise ValueError('invalid device-count result')
+        elif data.get('status')!='dry_run':
+            expected='cleared_local' if action=='clear-history' else 'erased_device'
+            if data.get('status')!=expected or not isinstance(data.get('backup'),str) or not data['backup']:
+                raise ValueError('clear result lacks backup or verification')
+            key='records' if action=='clear-history' else 'device_records'
+            count(key)
+            if data[key]!=0:raise ValueError('clear result is not empty')
     if action=='download':
         outcomes=data.get('downloads')
         if not isinstance(outcomes,list): raise ValueError('missing download outcomes')

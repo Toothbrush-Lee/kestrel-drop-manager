@@ -1,6 +1,7 @@
 """Build genuine pre-schema-5 fixtures without inventory columns or their index."""
 
 def remove_metadata(connection):
+    connection.execute('DROP TABLE IF EXISTS device_preferences')
     view=connection.execute("SELECT sql FROM sqlite_master WHERE name='device_overview'").fetchone()
     if view:connection.execute('DROP VIEW device_overview')
     connection.execute('DROP INDEX IF EXISTS devices_management_code')

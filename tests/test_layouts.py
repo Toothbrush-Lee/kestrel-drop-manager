@@ -63,7 +63,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(len(backups),1);Store(backups[0]).check()
         self.assertEqual(store.query('3'),Store(backups[0]).query('3'))
         self.assertEqual(len(store.query('3')),1)
-        with store.connect() as c: self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],5)
+        with store.connect() as c: self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],6)
         store.ensure_device('1','D1')
         t=store.begin_transfer('1',0,1)
         row=protocol.decode_record(RAW[:9],block=0,position=0,model='D1')

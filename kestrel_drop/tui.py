@@ -24,7 +24,7 @@ from .ui_actions import format_interval, setting_change, retry_download_argument
 
 PHASES = {'scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
           'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
-          'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库'}
+          'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库', 'auto_sync':'连接后自动同步历史', 'backing_up':'正在完整备份电脑档案', 'clearing_local':'正在清除本机历史（设备不改）', 'erasing_device':'正在清除设备日志（电脑历史保留）', 'checking_device_count':'正在回读设备日志条数', 'reading_settings':'正在读取设备设置'}
 STATUSES = {'downloaded': '已保存', 'saved_warning': '已保存，有提醒', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
             'verified': '配置已回读验证', 'not_attempted': '尚未执行', 'cancelled_unknown': '取消，需回读',
             'empty': '设备暂无记录', 'failed': '未完成', 'dry_run': '仅预演'}
@@ -93,6 +93,7 @@ class Terminal:
         self.needs_redraw = True
         self.result_view = None
         self.device_state = None
+        self.data_view = None
         self.review = None
         self.batch_settings = None
         self.device_progress = {}
@@ -158,7 +159,9 @@ class Terminal:
             self.action = None
             self.message = ('已取消；已落盘数据保留，可再次下载' if job.cancelled else
                             '操作完成' if value == 0 else f'操作未完成（退出码 {value}），请查看下方日志')
-            if (value == 0 or (action in ('list', 'scan') and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'blink', 'live', 'timing', 'metadata'):
+            if job.cancelled and action in ('clear-history','erase-device'):
+                self.message='清除可能已生效；先返回数据管理核对，电脑备份保留，不要直接重试'
+            if (value == 0 or (action in ('list', 'scan') and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'blink', 'live', 'timing', 'metadata', 'data-info', 'data-preferences', 'clear-history', 'erase-device', 'device-count'):
                 try:
                     payload = job.payload
                     if payload is None:
@@ -172,6 +175,7 @@ class Terminal:
                         if selected_serial and selected_serial in self.devices:
                             self.selected = list(self.devices).index(selected_serial)
                         self.message = f'扫描完成：{len(payload)} 个 DROP；已清空旧勾选 · 空格选择 / A 全选 · Enter 下载所选'
+                        if any(item.get('auto_sync_error') for item in payload):self.message='身份核验登记已完成，但有自动同步未完成项，按l核对日志'
                     elif action == 'list':
                         self.last_stamp=self.list_stamp
                         # Clear transient errors and old pending counts on refresh.
@@ -186,10 +190,13 @@ class Terminal:
                         self.message = (f'{failures} 个档案校验或入库失败，请查看选中设备及日志' if failures else
                                         self.refresh_message or f'已读取 {len(payload)} 个设备 · s 扫描 · Enter 下载')
                         self.refresh_message = None
+                        if self.data_view is not None:self.start('data-info',['data-info',self.data_view['serial']])
                     elif action in ('device','set'):
-                        self.device_state = payload if action=='device' else {**payload['before'],**payload['after']}
+                        state=payload if action=='device' else {**payload['before'],**payload['after']}
+                        if self.data_view is not None and state.get('serial')==self.data_view['serial']:self.data_view['state']=state
+                        else:self.device_state=state
                         self.message = ('时钟已回读；采样相位未验证，按 t 诊断' if payload['after'].get('sampling_risk') else '设置已回读验证') if action=='set' else '设备信息已读取；不会自动校时'
-                        self.device_state['read_stale']=False
+                        state['read_stale']=False
                     elif action == 'blink':
                         self.message = '已发送闪灯定位，请观察设备 LED'
                     elif action == 'live':
@@ -205,6 +212,16 @@ class Terminal:
                             self.selected = list(self.devices).index(serial)
                         self.message = (f'{payload["device_type"]} · {serial} 已核验登记；'
                                         + ('Enter 下载' if payload['history_supported'] else '历史格式待适配，可继续管理其他设备'))
+                    elif action=='device-count':
+                        if self.data_view is not None and payload['serial']==self.data_view['serial']:self.data_view['device_count']=payload
+                        self.message=f"设备日志 {payload['device_records']} 条（本次读取快照）；未同步或清除"
+                    elif action in ('data-info','data-preferences'):
+                        if self.data_view is not None and payload['serial']==self.data_view['serial']:self.data_view['info']=payload
+                        self.message='本机数据管理已刷新；r可连接读取设备设置' if action=='data-info' else ('已开启连接后自动同步（非定时下载）' if payload['auto_sync'] else '已关闭连接后自动同步')
+                    elif action in ('clear-history','erase-device'):
+                        if self.data_view is not None:
+                            self.data_view['notice']='电脑历史已清除；设备未改动。备份完整路径按l查看。' if action=='clear-history' else '设备清除已回读0条；电脑历史保留。备份路径按l查看。'
+                        self.message=('本机历史已清除；设备未改动' if action=='clear-history' else '设备日志已清除并回读0条；电脑历史保留')+'；备份：'+payload['backup']
                     elif action=='metadata':
                         self.devices=merge_devices(self.devices,[payload])
                         self.message='本地设备资料已保存；不改变设备设置或历史观测归属'
@@ -228,7 +245,8 @@ class Terminal:
                         self.message = f'已导入完整档案：{payload["database"]}（按 l 查看完整路径）'
                 except (ValueError, TypeError, KeyError) as exc:
                     self.message = f'无法读取任务结果：{exc}'
-            if action in ('download', 'import', 'migrate', 'configure', 'register', 'identify', 'set', 'set-batch', 'metadata'):
+            auto_refresh=action in ('device','live','blink') and (bool((job.payload or {}).get('auto_synced')) or bool(self.data_view and (self.data_view.get('info') or {}).get('auto_sync')))
+            if auto_refresh or action in ('download', 'import', 'migrate', 'configure', 'register', 'identify', 'set', 'set-batch', 'metadata', 'data-preferences', 'clear-history', 'erase-device'):
                 self.refresh_message = self.message
                 self.start('list', ['list'])
             if action in ('download','set-batch') or (value and action != 'list'):
@@ -238,7 +256,7 @@ class Terminal:
                 if value and not failures:
                     failures = [{'code': 'worker_failed', 'message': '后台任务未完成。', 'retryable': False,
                                  'action': '按 l 查看日志，检查后台启动或事件通信问题。'}]
-                if action in ('set','blink','set-batch'):
+                if action in ('set','blink','set-batch','clear-history','erase-device'):
                     for failure in failures: failure['retryable']=False
                 self.result_view = {'outcomes': outcomes, 'failures': failures, 'code': value,
                                     'action': action, 'arguments': job.arguments, 'selected':0}
@@ -254,14 +272,15 @@ class Terminal:
         if kind == 'log':
             self.logs.append(event['message'])
         elif kind == 'phase':
+            if event['phase'] in ('backing_up','clearing_local','erasing_device','checking_device_count','reading_settings'):self.progress=''
             self.message = f'{event.get("serial", "")} · {PHASES.get(event["phase"], event["phase"])}'
         elif kind == 'progress':
-            self.progress = (f'{event["received"]:,}/{event["expected"]:,} 条  {event["rate"]:.1f} 条/秒  '
+            self.progress = (f'{100*event["received"]/event["expected"] if event["expected"] else 0:.0f}% · {event["received"]:,}/{event["expected"]:,} 条  {event["rate"]:.1f} 条/秒  '
                              f'已用 {TransferProgress.duration(event["elapsed"])}  '
                              f'预计剩余 {TransferProgress.duration(event["eta"])}')
         elif kind == 'result':
             self.job.payload = event['data']
-            if self.action in ('export', 'backup', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set'):
+            if self.action in ('export', 'backup', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'clear-history', 'erase-device', 'device-count'):
                 self.logs.append('结果：' + json.dumps(event['data'], ensure_ascii=False))
         elif kind == 'completed':
             for item in self.devices.values():
@@ -315,12 +334,23 @@ class Terminal:
                 self.review=batch_setting_change(action,values[0],self.form['targets'])
                 return
             elif action.startswith('set_'):
-                self.review=setting_change(action,values[0],self.device_state)
+                self.review=setting_change(action,values[0],self.form.get('settings_state',self.device_state))
                 return
             elif action == 'timing':
                 interval=int(values[0])
                 if not 2<=interval<=86400:raise ValueError('预期间隔须为2–86400秒')
                 if self.start('timing',['timing',self.form['target'],'--interval',str(interval)]) is False:return
+            elif action in ('clear-history','erase-device'):
+                if values[0]!=self.form['target']:raise ValueError('请输入这台设备的完整序列号确认')
+                serial=self.form['target'];info=self.form['data_info']
+                label='清除电脑端历史' if action=='clear-history' else '清除设备内部日志'
+                args=[action,serial,'--confirm-serial',values[0],'--expected-revision',info['revision'],'--execute']
+                if action=='erase-device' and self.data_view.get('ble_id'):args+=['--ble-id',self.data_view['ble_id']]
+                self.review={'serial':serial,'action':action,'label':label,'old':f"电脑正式记录 {info['records']} 条，暂存块 {info['pending_blocks']} 个",
+                    'new':'仅清电脑历史，设备日志不改' if action=='clear-history' else '清设备全部日志，保留电脑档案',
+                    'impact':'执行前自动生成完整SQLite备份；保留设备管理编号、受试者代号及审计。设备清除会先完整同步，采集不中止，读写间可能新增记录。',
+                    'arguments':args}
+                return
             elif action=='metadata':
                 from .metadata import clean
                 old=self.form['before']
@@ -401,6 +431,7 @@ class Terminal:
             self.text_offset=max(0,len(self.wrapped_text())-self.screen.getmaxyx()[0]+4)
         else:
             self.text_view=[
+                'h 数据管理：同步/导出、日志设置、连接后自动同步，以及分开的电脑历史与设备日志清除。',
                 'z 编辑当前设备的本地管理编号和受试者代号；预览后确认保存，不连接蓝牙。',
                 '快速开始：s 扫描 15 秒 → ↑↓ 选择 → Enter 下载 → e 导出。',
                 '已知地址按目标定位，发现即连接；默认扫描 15 秒。',
@@ -442,7 +473,7 @@ class Terminal:
         elif key==curses.KEY_PPAGE: selected=max(0,selected-step)
         elif key==curses.KEY_HOME: selected=0
         elif key==curses.KEY_END: selected=max(0,len(outcomes)-1)
-        elif key=='r' and view['action'] not in ('set','set-batch','blink') and any(f.get('retryable') for f in view['failures']) and not self.job:
+        elif key=='r' and view['action'] not in ('set','set-batch','blink','clear-history','erase-device') and any(f.get('retryable') for f in view['failures']) and not self.job:
             args=retry_download_arguments(view['arguments'],outcomes,view['failures']) if view['action']=='download' else view['arguments']
             if args is None: self.message='所有可重试项均已保存；其余问题请核对后从列表选择'
             elif self.start(view['action'],args) is not False: self.result_view=None
@@ -464,7 +495,7 @@ class Terminal:
         self.needs_redraw = True
         if self.job and key=='c':
             self.job.cancel()
-            self.message='正在取消；配置可能部分生效，请在取消后重新读取' if self.action in ('set','blink','set-batch') else '正在取消，等待连接清理'
+            self.message='正在取消；清除可能已生效，返回数据管理核对，不直接重试' if self.action in ('clear-history','erase-device') else '正在取消；配置可能部分生效，请在取消后重新读取' if self.action in ('set','blink','set-batch') else '正在取消，等待连接清理'
             return True
         if self.review is not None:
             if key in ('\x1b','q'): self.review=None
@@ -475,6 +506,7 @@ class Terminal:
                 if self.start(action,self.review['arguments']) is not False:
                     self.review=None;self.form=None
                     if action=='set-batch': self.batch_settings=None
+                    elif action=='set' and self.data_view is not None:self.data_view['state']['read_stale']=True
                     elif action=='set' and self.device_state is not None: self.device_state['read_stale']=True
                 else: self.review['error']=self.message
             return True
@@ -504,6 +536,14 @@ class Terminal:
             elif key==curses.KEY_HOME:self.preview_offset=0
             elif key==curses.KEY_END:self.preview_offset=max(0,len(self.preview)-max(1,self.screen.getmaxyx()[0]-5))
             return True
+        if key=='h' and not self.job and self.data_view is None and self.batch_settings is None:
+            item=self.devices.get(self.device_state['serial']) if self.device_state is not None else self.selected_device()
+            if not item or not item.get('database'):self.message='请先核验登记设备，再打开数据管理'
+            else:
+                self.data_view={'serial':item['serial'],'ble_id':item.get('ble_id'),'info':None,'state':self.device_state}
+                self.start('data-info',['data-info',item['serial']])
+            return True
+        if self.data_view is not None:return self.handle_data(key)
         if key=='t' and not self.job and self.batch_settings is None:
             device=self.device_state or self.selected_device()
             if not device or not device.get('serial'):self.message='请选择已有档案的设备'
@@ -695,6 +735,79 @@ class Terminal:
         for index,item in enumerate(targets[top:top+count],top):
             self.put(row+index-top,f"{index+1:>3}. {item['serial']} · {item.get('device_type','')} · {item.get('ble_id') or '按编号寻找'}",curses.A_REVERSE if index==offset else 0)
 
+    def handle_data(self,key):
+        view=self.data_view;serial=view['serial'];info=view.get('info');state=view.get('state')
+        if self.job:
+            self.message='正在处理；c可取消，完成后再返回'
+            return True
+        if key in ('q','\x1b'):
+            if self.device_state is not None and self.device_state.get('serial')==serial and view.get('state') is not None:self.device_state=view['state']
+            self.data_view=None;return True
+        view.pop('notice',None)
+        if key=='i':self.start('data-info',['data-info',serial])
+        elif key=='c':
+            args=['device-count',serial]
+            if view.get('ble_id'):args+=['--ble-id',view['ble_id']]
+            self.start('device-count',args)
+        elif key=='r':
+            args=['device',serial]
+            if view.get('ble_id'):args+=['--ble-id',view['ble_id']]
+            self.start('device',args)
+        elif key=='s':
+            args=['download','--serial',serial,'--execute']
+            if view.get('ble_id'):args+=['--ble-id',view['ble_id']]
+            self.start('download',args)
+        elif key=='e':
+            output=self.library.root/'exports'/f'kestrel_{serial}_{datetime.now():%Y%m%d-%H%M%S}.csv'
+            self.open_form('导出电脑已同步的记录',[('输出CSV路径',str(output)),('开始时间（可空）',''),('结束时间（可空）','')],'export');self.form['target']=serial
+        elif key=='v':self.start('records',['records',serial,'--limit','100'])
+        elif key=='b':self.start('backup',['backup'])
+        elif key=='4' and info:
+            self.start('data-preferences',['data-preferences',serial,'--auto-sync','off' if info['auto_sync'] else 'on'])
+        elif key in ('1','2','3'):
+            if not state or not state.get('settings') or state.get('read_stale'):self.message='请先按r读取设备最新设置'
+            else:
+                settings=state['settings']
+                title,value,action={'1':('Device Sync Rate：实时刷新秒数',settings.get('update_seconds'),'set_update'),
+                    '2':('Data Logging Rate：日志采样秒数',settings.get('interval_seconds'),'set_interval'),
+                    '3':('Wrap Log：on覆盖 / off满后停止','on' if settings.get('wrap') else 'off','set_wrap')}[key]
+                field={'1':'update_seconds','2':'interval_seconds','3':'wrap'}[key]
+                if settings.get(field) is None:self.message='未读到此设置，请按r重新读取'
+                else:
+                    self.open_form(title,[('新值（Enter预览）',value)],action)
+                    self.form['target']=serial;self.form['settings_state']=state
+        elif key in ('7','8') and info:
+            action='clear-history' if key=='7' else 'erase-device'
+            title='清除电脑端历史：设备未改动' if key=='7' else '清除设备日志：先同步备份，电脑记录保留'
+            self.open_form(title,[('输入本台完整序列号确认（Esc取消）','')],action)
+            self.form['target']=serial;self.form['data_info']=dict(info)
+        return True
+
+    def draw_data(self,height,width):
+        view=self.data_view;info=view.get('info') or {};state=view.get('state') or {};settings=state.get('settings') or {}
+        label=info.get('management_code') or '未编号'
+        self.put(0,f"数据管理 · {label} · {view['serial']}",curses.A_BOLD)
+        if view.get('info') is None:
+            self.put(2,'正在读取本机档案；条数尚未获得' if self.job else '尚未读到本机摘要，按i重试',curses.A_BOLD)
+            self.put(height-2,self.message)
+            self.put(height-1,'c取消任务；i重读本机摘要；Esc返回',curses.A_DIM)
+            return
+        self.put(1,f"电脑末条记录：{info.get('last_record') or '暂无'}")
+        self.put(2,f"电脑正式记录 {info.get('records',0)} 条 · 暂存块 {info.get('pending_blocks',0)}；末条不是当前时钟",curses.A_DIM)
+        count=(view.get('device_count') or {}).get('device_records')
+        self.put(3,f"设备日志条数（上次读取）：{count if count is not None else '未读取，按c'}",curses.A_DIM)
+        self.put(4,f"1 Device Sync Rate 实时刷新：{format_interval(settings.get('update_seconds'))}")
+        self.put(5,f"2 Data Logging Rate 采样：{format_interval(settings.get('interval_seconds'))}")
+        self.put(6,'3 Wrap Log 滚动覆盖：'+('未读取' if settings.get('wrap') is None else '开启' if settings['wrap'] else '关闭'))
+        self.put(7,'4 Auto Sync Log 连接后自动同步：'+('开启' if info.get('auto_sync') else '关闭'))
+        self.put(8,'自动同步不等于定时下载；实时刷新不改变采样间隔。',curses.A_DIM)
+        self.put(10,'7 清除电脑端历史（设备日志不改）')
+        self.put(11,'8 清除设备内部日志（电脑历史保留）')
+        self.put(height-4,self.progress or view.get('notice') or self.message,curses.A_BOLD)
+        self.put(height-3,'清除先备份，输入完整序列号并再次确认；仅单台。',curses.A_DIM)
+        self.put(height-2,'s 同步  e 导出  v 预览  r 读设置  c 读条数  i 刷新  b 备份')
+        self.put(height-1,'1–3需先r读取设备；4仅本机偏好 · Esc返回',curses.A_DIM)
+
     def draw_batch_settings(self,height,width):
         self.screen.erase()
         view=self.batch_settings
@@ -719,7 +832,7 @@ class Terminal:
         for state, drawer in ((self.review,self.draw_review), (self.form,self.draw_form),
                               (self.text_view,self.draw_text), (self.result_view,self.draw_result),
                               (self.preview,self.draw_preview), (self.batch_settings,self.draw_batch_settings),
-                              (self.device_state,self.draw_device)):
+                              (self.data_view,self.draw_data), (self.device_state,self.draw_device)):
             if state is not None:
                 return drawer
         return self.draw_dashboard
@@ -787,7 +900,7 @@ class Terminal:
         log_start=row+4
         for offset,line in enumerate(list(self.logs)[-max(1,height-log_start-3):]):self.put(log_start+offset,line,curses.A_DIM)
         self.put(height-2,'Enter 下载所选/当前  s 扫描  空格勾选  A 全选  a 下载所选  g 设置')
-        self.put(height-1,'z 设备资料  t 时间诊断  u 清空  j 并发  b 备份  l 日志  ? 帮助  q 退出',curses.A_DIM)
+        self.put(height-1,'h 数据管理  z 资料  q 退出  ? 帮助  t 诊断  j 并发  b 备份  l 日志',curses.A_DIM)
 
     def draw_preview(self,height,width):
         self.screen.erase()
@@ -824,7 +937,7 @@ class Terminal:
                '3 校准设备时间（不改旧记录）   4 修改设备名称',
                f'5 实时更新间隔：{format_interval(settings.get("update_seconds"))}']
         if (state.get('device_type') or model_type(state.get('model')))=='D3':lines.append(f'6 气压参考海拔：{settings.get("reference_altitude_m")} 米')
-        lines+=['r 重新读取  t 时间诊断  w 实时测量  f 闪灯  b 备份',
+        lines+=['h 数据管理  r 重新读取  t 时间诊断  w 实时测量  f 闪灯  b 备份',
                 '显示的是上次读取值，修改结果未确认：请先 r 回读' if state.get('read_stale') else self.message]
         if state.get('live'):
             readings=state['live']['measurements']
@@ -862,6 +975,8 @@ class Terminal:
             'set_name':'仅支持1–20个可打印ASCII字符，如 Lab-01；真实设备编号不会改变。',
             'set_update':'范围2–60秒，影响实时刷新，与历史采样间隔分开。',
             'set_altitude':'单位为米，可为负值；只用于气压计算，不改出厂校准。',
+            'clear-history':'仅清电脑端正式记录和暂存，保留设备资料；先备份。设备日志未删除，下次同步可能重新下载。',
+            'erase-device':'先同步并备份，再擦除设备日志；不删除电脑档案，不停采或校时，不自动重试。',
             'metadata':'已有管理编号与序列号固定，不可修改或清空。新设备首次填写编号，保存后锁定。受试者代号可修改或清空；不填真实姓名。',
             'export':'不筛选时间可直接按 Enter 跳过；结束日期包含当天整天。'}
         start=4+min(count,len(form['fields']))*3
@@ -878,7 +993,7 @@ class Terminal:
     def draw_review(self,height,width):
         self.screen.erase()
         review=self.review
-        self.put(0,'检查本地设备资料' if review.get('action')=='metadata' else '检查设备变更',curses.A_BOLD)
+        self.put(0,'危险操作：核对清除范围' if review.get('action') in ('clear-history','erase-device') else '检查本地设备资料' if review.get('action')=='metadata' else '检查设备变更',curses.A_BOLD)
         if review.get('targets'):
             self.put(1,f"{len(review['targets'])} 台 · {review['label']}",curses.A_BOLD)
             for row,line in enumerate(wrap_lines('准备写入：'+review['new'],width-3)[:2],2):self.put(row,line)
@@ -888,14 +1003,14 @@ class Terminal:
         else:
             lines=[f'设备编号：{review["serial"]}',f'修改项目：{review["label"]}',
                    f'上次读取：{review["old"]}',f'准备写入：{review["new"]}','',review['impact'],
-                   ('只保存到本机 SQLite，不校时、不改设备名称。' if review.get('action')=='metadata' else '写入前会重新核验设备，并以设备最新设置为基础只修改此项。')]
+                   ('两种清除互不替代；仅当前设备，不支持批量。' if review.get('action') in ('clear-history','erase-device') else '只保存到本机 SQLite，不校时、不改设备名称。' if review.get('action')=='metadata' else '写入前会重新核验设备，并以设备最新设置为基础只修改此项。')]
             if '--time' in review['arguments'] and 'now' in review['arguments']:
                 lines.append('预览时电脑本地时间：'+datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'))
             wrapped=[line for text in lines for line in wrap_lines(text,width-3)]
             for row,line in enumerate(wrapped[:height-5],2):self.put(row,line)
         if review.get('error'):self.put(height-4,review['error'],curses.A_BOLD)
-        self.put(height-2,'Enter 保存本地资料 · Esc 返回修改' if review.get('action')=='metadata' else 'Enter 写入并回读验证 · Esc 返回修改',curses.A_BOLD)
-        self.put(height-1,'仅当前领用信息，不改变历史观测归属。' if review.get('action')=='metadata' else self.message if self.job else '仅此步骤会发送配置；关闭预览不会改变设备',curses.A_DIM)
+        self.put(height-2,'Enter 执行已确认的单台清除 · Esc 取消' if review.get('action') in ('clear-history','erase-device') else 'Enter 保存本地资料 · Esc 返回修改' if review.get('action')=='metadata' else 'Enter 写入并回读验证 · Esc 返回修改',curses.A_BOLD)
+        self.put(height-1,'先备份；保留管理编号和受试者代号；结果不明先核对，禁止直接重试。' if review.get('action') in ('clear-history','erase-device') else '仅当前领用信息，不改变历史观测归属。' if review.get('action')=='metadata' else self.message if self.job else '仅此步骤会发送配置；关闭预览不会改变设备',curses.A_DIM)
 
     def draw_result(self,height,width):
         self.screen.erase()
