@@ -505,7 +505,7 @@ class Terminal:
                 self.form['target']=device['serial']
             return True
         if key=='z' and not self.job and self.batch_settings is None:
-            device=self.devices.get((self.device_state or {}).get('serial')) or self.selected_device()
+            device=self.devices.get(self.device_state['serial']) if self.device_state is not None else self.selected_device()
             self.open_metadata(device)
             return True
         if self.batch_settings is not None:

@@ -177,3 +177,8 @@ class MetadataTests(unittest.TestCase):
             path.write_text(content)
             with self.assertRaises(ValueError):self.library.import_labels(path,execute=True)
         self.assertEqual(self.library.metadata('2')['management_code'],'')
+
+    def test_unknown_device_page_never_falls_back_to_another_selected_device(self):
+        t=Terminal(Screen(),self.library);t.devices={item['serial']:item for item in self.library.status()}
+        t.device_state={'serial':'999'};t.handle('z')
+        self.assertIsNone(t.form);self.assertIn('核验登记',t.message)
