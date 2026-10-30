@@ -3,6 +3,7 @@
 Settings writes preserve every unrequested byte. Device identity is checked by
 Library before any write. Erase, defaults, security and firmware are not exposed.
 """
+import asyncio
 from datetime import datetime
 
 from .errors import TransferError
@@ -125,12 +126,50 @@ def selective_settings_payload(raw, changes):
     return bytes(payload),expected
 
 
+class SettingsVerificationError(TransferError):
+    def __init__(self,message,readback):
+        super().__init__(message)
+        self.readback=readback
+
+
+async def verify_settings(client, expected, requested):
+    """One write may need time to settle. Retry reads only; bytes 9–19 are unused."""
+    samples=[]
+    for delay in (0,0.15,0.35,0.75):
+        if delay:await asyncio.sleep(delay)
+        try:raw=bytes(await gatt_wait(client.read_gatt_char(SETTINGS_UUID),15))
+        except Exception as exc:
+            raise SettingsVerificationError(f'设置回读未完成：{exc}；未重发设置，请重新读取',
+                {'settings_readback_samples':samples,'settings_expected_raw_hex':expected.hex(),'settings_verification_complete':False}) from exc
+        samples.append(raw.hex())
+        # Decode validates length and enum values before accepting a snapshot.
+        try:settings=decode_settings(raw)
+        except ValueError as exc:
+            raise SettingsVerificationError(f'设置回读格式无效：{exc}',{'settings_readback_samples':samples,'settings_raw_hex':raw.hex(),'settings_expected_raw_hex':expected.hex(),'settings_verification_complete':False}) from exc
+        if raw[:9]==expected[:9]:
+            return raw,{'settings_verification_complete':True,'settings_readback_attempts':len(samples),'settings_readback_samples':samples,
+                        'settings_unused_changed_offsets':[i for i in range(9,20) if raw[i]!=expected[i]]}
+    differences=[{'offset':i,'expected':expected[i],'actual':raw[i]} for i in range(9) if raw[i]!=expected[i]]
+    fields={name:(start,end) for name,start,end in (
+        ('interval_seconds',0,3),('wrap',3,4),('update_seconds',4,5),
+        ('security_level',5,6),('setup_complete',6,7),('reference_altitude_m',7,9))}
+    changed=[name for name,(start,end) in fields.items() if raw[start:end]!=expected[start:end]]
+    selected=[name for name in changed if name in requested]
+    detail='；'.join(f"字节{item['offset']} 预期{item['expected']:02x}/实际{item['actual']:02x}" for item in differences)
+    labels={'interval_seconds':'采样间隔','wrap':'滚动覆盖','update_seconds':'实时刷新间隔','security_level':'安全级别','setup_complete':'初始化状态','reference_altitude_m':'参考海拔'}
+    names=lambda items:','.join(f'{labels[name]}({name})' for name in items)
+    message=('请求字段写入后回读不一致：'+names(selected) if selected else '未选择的设置字段发生变化：'+names(changed))
+    raise SettingsVerificationError(message+'；'+detail+'；已多次只读核对，未重发设置，请重新读取',
+        {'settings':settings,'settings_raw_hex':raw.hex(),'settings_expected_raw_hex':expected.hex(),
+         'settings_readback_samples':samples,'settings_readback_attempts':len(samples),'settings_verification_complete':False,'settings_differences':differences})
+
+
 def clock_risk(changes):
     return {'schedule_alignment_verified':False,
             'warning':'校时可能平移后续记录相位，产生跳时或重复时间；300秒间隔不保证整5分钟采样。需观察之后至少两条记录确认。'} if 'time' in changes else None
 
 
-async def inspect(client, *, stable=None, clock_read=None):
+async def inspect(client, *, stable=None, clock_read=None, settings_read=None):
     from bleak.exc import BleakError
     stable = stable or {}
     result, errors = {}, {}
@@ -144,7 +183,7 @@ async def inspect(client, *, stable=None, clock_read=None):
             result[name] = stable[name]
             continue
         try:
-            raw = bytes(await gatt_wait(client.read_gatt_char(characteristic), 15))
+            raw = settings_read if name=='settings' and settings_read is not None else bytes(await gatt_wait(client.read_gatt_char(characteristic), 15))
             result[name] = decode(raw)
             if name == 'settings': result['settings_raw_hex'] = raw.hex()
         except (BleakError, ValueError, UnicodeError, TimeoutError, IndexError) as exc:
@@ -168,16 +207,13 @@ async def apply(client, changes, before, *, allow_schedule_shift=False):
         raise TransferError('未读到设备当前设置，拒绝覆盖')
     async def write(characteristic, payload):
         await gatt_wait(client.write_gatt_char(characteristic, payload, response=True), 15)
+    settings_read=None;settings_evidence={}
     if any(k in changes for k in ('interval_seconds','wrap','update_seconds','reference_altitude_m')):
         raw_before=bytes.fromhex(before['settings_raw_hex'])
         effective={key:value for key,value in changes.items() if key in before['settings'] and before['settings'][key]!=value}
         payload,expected=selective_settings_payload(raw_before,effective)
         if effective: await write(SETTINGS_UUID, payload)
-        actual_raw=bytes(await gatt_wait(client.read_gatt_char(SETTINGS_UUID),15))
-        actual = decode_settings(actual_raw)
-        for field in changes.keys() & actual.keys():
-            if actual[field] != changes[field]: raise TransferError(f'{field} 写入后回读不一致；请重新读取，不自动重试')
-        if actual_raw!=expected: raise TransferError('设置中未选择的字节发生变化；请重新读取核对')
+        settings_read,settings_evidence=await verify_settings(client,expected,changes)
     if 'name' in changes:
         if before.get('name')!=changes['name']:
             await write(NAME_UUID, changes['name'].encode('ascii').ljust(20, b'\0'))
@@ -203,7 +239,8 @@ async def apply(client, changes, before, *, allow_schedule_shift=False):
         delta = (datetime.fromisoformat(actual)-datetime.fromisoformat(value)).total_seconds()
         if not skipped and not 0 <= delta <= 10: raise TransferError('设备时间写入后回读偏差过大，请重新读取')
     # Reuse only stable fields and the clock read already verified on this connection.
-    after = await inspect(client, stable=before, clock_read=clock_read)
+    after = await inspect(client, stable=before, clock_read=clock_read,settings_read=settings_read)
+    after.update(settings_evidence)
     if any(k in changes for k in ('interval_seconds','wrap','update_seconds','reference_altitude_m')):
         after.update(settings_write_skipped=not bool(effective),settings_written_fields=sorted(effective))
     if 'time' in changes:

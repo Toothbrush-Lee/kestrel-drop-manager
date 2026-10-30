@@ -335,7 +335,7 @@ class Library:
                         timings['audit'] += time.monotonic() - audit_started
                         return {'serial':serial,'status':'verified','action_id':action,'before':result,'after':after,'auto_synced':auto_synced}
                     except BaseException as exc:
-                        store.finish_action(action,error=f'{type(exc).__name__}: {exc}; device may have changed; read back before retry')
+                        store.finish_action(action,after=getattr(exc,'readback',None),error=f'{type(exc).__name__}: {exc}; device may have changed; read back before retry')
                         if isinstance(exc, asyncio.CancelledError): raise
                         raise ConfigurationFailure(str(exc)) from exc
             result = await _ble_call(connected)
