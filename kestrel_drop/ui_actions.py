@@ -43,7 +43,7 @@ def setting_change(action, value, state):
     if field=='time': args+=['--allow-schedule-shift']
     if state.get('ble_id'): args += ['--ble-id', state['ble_id']]
     return {'serial': state['serial'], 'label': label, 'old': display(old),
-            'new': '提交时的电脑本地时间' if field == 'time' and value == 'now' else display(converted),
+            'new': '发送校时命令前的电脑本地时间' if field == 'time' and value == 'now' else display(converted),
             'impact': impact, 'arguments': args}
 
 

@@ -121,3 +121,33 @@ class ClockAndSettingsSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(after['time_write_skipped']);self.assertFalse(fake.writes)
         self.assertFalse(after['sampling_risk']['schedule_alignment_verified'])
         self.assertEqual(after['settings']['interval_seconds'],300)
+
+
+class ClockSendTimingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_now_is_captured_after_delayed_notification_setup(self):
+        class Clock(datetime):
+            tick=10
+            @classmethod
+            def now(cls,tz=None):return cls(2026,10,26,12,0,cls.tick)
+        fake=FakeControl()
+        original=fake.client.start_notify
+        async def delayed(*args):
+            Clock.tick+=3
+            await original(*args)
+        with fake.patches():before=await control.inspect(fake.client)
+        with fake.patches(),patch.object(control,'datetime',Clock),patch.object(fake.client,'start_notify',side_effect=delayed):
+            after=await control.apply(fake.client,{'time':'now'},before,allow_schedule_shift=True)
+        writes=[frame for frame in fake.mass_writes if frame.kind==0 and frame.payload[:2]==b'\x0f\0']
+        self.assertEqual(len(writes),1)
+        self.assertEqual(control.decode_link_time(writes[0].payload[2:]),'2026-10-26 12:00:16')
+        self.assertEqual(after['time_write_target_local'],'2026-10-26 12:00:16')
+        self.assertEqual(after['clock_correction_seconds'],16)
+        self.assertEqual(after['time_source'],'computer_at_send')
+        self.assertIn('12:00:16',after['computer_time_at_send'])
+    async def test_fixed_input_is_not_replaced_with_computer_time(self):
+        fake=FakeControl()
+        with fake.patches():
+            before=await control.inspect(fake.client)
+            after=await control.apply(fake.client,{'time':'2026-10-26 12:00:42'},before,allow_schedule_shift=True)
+        self.assertEqual(after['time_write_target_local'],'2026-10-26 12:00:42')
+        self.assertEqual(after['time_source'],'fixed_input')

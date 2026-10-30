@@ -98,7 +98,7 @@ class PlanningTests(unittest.TestCase):
     def test_chinese_wrap_and_clock_review(self):
         state={'serial':'123','settings':{'wrap':True}}
         self.assertEqual(setting_change('set_wrap','关闭',state)['arguments'][3],'off')
-        self.assertIn('提交时',setting_change('set_time','now',state)['new'])
+        self.assertIn('发送校时命令前',setting_change('set_time','now',state)['new'])
     def test_unicode_wrap_preserves_all_text_and_cell_limit(self):
         text='中文/很长的路径/abc'*20
         lines=wrap_lines(text,17);self.assertEqual(''.join(lines),text)

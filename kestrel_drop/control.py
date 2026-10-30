@@ -55,7 +55,10 @@ async def clock(client, value=None):
     session=protocol.BleSession(client,model='D1')
     await gatt_wait(client.start_notify(protocol.UP_UUID,session.callback),15)
     try:
-        if value is not None: await session.write_command(15,encode_link_time(value))
+        if value is not None:
+            # Evaluate a dynamic target only after notifications are ready.
+            target=value() if callable(value) else value
+            await session.write_command(15,encode_link_time(target))
         raw=await session.read_command(14)
         return decode_link_time(raw),raw.hex()
     finally:
@@ -188,7 +191,14 @@ async def apply(client, changes, before, *, allow_schedule_shift=False):
         value = computer_clock.replace(tzinfo=None).isoformat(sep=' ') if changes['time']=='now' else changes['time']
         correction=(datetime.fromisoformat(value)-datetime.fromisoformat(clock_before[0])).total_seconds()
         skipped=changes['time']=='now' and abs(correction)<=1
-        clock_read=clock_before if skipped else await clock(client,value)
+        def target_at_send():
+            nonlocal value,computer_clock,correction
+            computer_clock=datetime.now().astimezone().replace(microsecond=0)
+            if changes['time']=='now':
+                value=computer_clock.replace(tzinfo=None).isoformat(sep=' ')
+                correction=(datetime.fromisoformat(value)-datetime.fromisoformat(clock_before[0])).total_seconds()
+            return value
+        clock_read=clock_before if skipped else await clock(client,target_at_send)
         actual,_ = clock_read
         delta = (datetime.fromisoformat(actual)-datetime.fromisoformat(value)).total_seconds()
         if not skipped and not 0 <= delta <= 10: raise TransferError('设备时间写入后回读偏差过大，请重新读取')
@@ -199,6 +209,8 @@ async def apply(client, changes, before, *, allow_schedule_shift=False):
     if 'time' in changes:
         after.update(time_write_target_local=value,time_write_skipped=skipped,
                      computer_time_at_check=computer_clock.isoformat(),
+                     computer_time_at_send=None if skipped else computer_clock.isoformat(),
+                     time_source='computer_at_send' if changes['time']=='now' else 'fixed_input',
                      clock_before_write_local=clock_before[0],clock_correction_seconds=correction,
                      sampling_risk=clock_risk(changes))
     return after

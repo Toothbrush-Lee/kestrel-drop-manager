@@ -131,7 +131,7 @@ class BatchConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.library.store.actions('456'),[])
     async def test_real_clock_writes_each_device_current_time_and_audits(self):
         from datetime import datetime
-        stamps=iter([datetime(2026,10,27,1,0,1),datetime(2026,10,27,1,0,8)])
+        stamps=iter([datetime(2026,10,27,1,0,second) for second in (0,1,7,8)])
         class Clock(datetime):
             @classmethod
             def now(cls, tz=None):return next(stamps)

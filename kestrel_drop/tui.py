@@ -30,42 +30,76 @@ STATUSES = {'downloaded': '已保存', 'saved_warning': '已保存，有提醒',
             'empty': '设备暂无记录', 'failed': '未完成', 'dry_run': '仅预演'}
 
 
-def merge_devices(current, incoming, *, scan=False):
-    """Merge transient locators without conflating serials or losing archives."""
-    result = {key: dict(value) for key, value in current.items()
-              if not scan or (value.get('serial') and '@' not in key)}
+SCAN_RETENTION_SECONDS = 10 * 60
+
+
+def _merge_identity(old, observation):
+    item=dict(observation)
+    if item.get('identity_verified'):
+        item['model_conflict']=False
+        item['identity_conflict']=bool(item.get('identity_conflict'))
+    if old.get('identity_verified') and not item.get('identity_verified'):
+        if item.get('device_type') not in (None, '未知', old.get('device_type')):
+            item['identity_conflict']=item['model_conflict']=True
+        for field in ('model','device_type','history_supported','supported','identity_verified'):
+            if field in old:item[field]=old[field]
+    return {**old,**item}
+
+
+def _retained_devices(current, now):
+    result={}
+    for key,value in current.items():
+        item=dict(value);seen=item.get('last_seen_monotonic')
+        if seen is not None and not 0 <= now-seen < SCAN_RETENTION_SECONDS:
+            item['nearby']=item['seen_this_scan']=False
+        if (not item.get('serial') or '@' in key) and not item.get('nearby'):continue
+        if item.pop('address_conflict',False):item['identity_conflict']=bool(item.get('model_conflict'))
+        result[key]=item
+    # When one of two ambiguous locators expires, keep one canonical serial row.
+    by_serial={}
+    for key,item in result.items():
+        if item.get('serial') and item.get('nearby'):by_serial.setdefault(item['serial'],[]).append((key,item))
+    for serial,active in by_serial.items():
+        if len(active)==1 and active[0][0]!=serial:
+            key,item=active[0];result[serial]=_merge_identity(result.get(serial,{}),item);del result[key]
+        elif len({item.get('ble_id') for _,item in active})>1:
+            for _,item in active:item['identity_conflict']=item['address_conflict']=True
+    return result
+
+
+def merge_devices(current, incoming, *, scan=False, now=None):
+    """Accumulate recent BLE sightings; retain archives and verify identity separately."""
+    now=time.monotonic() if now is None else now
+    prepared={key:dict(value) for key,value in current.items()}
     if scan:
-        for item in result.values():
-            item['nearby'] = False
-            item.pop('identity_conflict', None)
+        for item in prepared.values():
+            item['seen_this_scan']=False
+            if item.get('last_seen_monotonic') is None:item['nearby']=False
+    result=_retained_devices(prepared,now)
     for observation in incoming:
         item = dict(observation)
         serial, address = item.get('serial'), item.get('ble_id')
-        if scan: item['nearby'] = True
+        if scan:item.update(nearby=True,seen_this_scan=True,last_seen_monotonic=now)
+        if not serial and address:
+            known={old['serial'] for old in result.values() if old.get('serial') and old.get('ble_id')==address and (old.get('identity_verified') or old.get('database'))}
+            if len(known)==1:serial=item['serial']=known.pop()
         if serial and address:
             for key, old in list(result.items()):
                 if old.get('ble_id') == address and not old.get('serial'):
+                    # Identity discovery must retain the original sighting expiry.
+                    item={**{field:old[field] for field in ('nearby','seen_this_scan','last_seen_monotonic') if field in old},**item}
                     del result[key]
                 elif old.get('ble_id') == address and old.get('serial') != serial:
                     if old.get('identity_verified') or old.get('database'):
                         old['ble_id'], old['nearby'] = None, False
-                    else:
-                        del result[key]
+                    else:del result[key]
         key = serial or 'ble:' + str(address)
         old = result.get(key, {})
-        if (serial and address and old.get('nearby') and old.get('ble_id')
-                and old['ble_id'] != address):
-            old['identity_conflict'] = item['identity_conflict'] = True
+        if (serial and address and old.get('nearby') and old.get('ble_id') and old['ble_id'] != address):
             key = serial + '@' + address
             old = result.get(key, {})
-        # A broadcast must not downgrade a GATT-verified model to a name hint.
-        if old.get('identity_verified') and not item.get('identity_verified'):
-            if item.get('device_type') not in (None, '未知', old.get('device_type')):
-                item['identity_conflict'] = True
-            for field in ('model','device_type','history_supported','supported','identity_verified'):
-                if field in old: item[field] = old[field]
-        result[key] = {**old, **item}
-    return result
+        result[key] = _merge_identity(old,item)
+    return _retained_devices(result,now)
 
 
 
@@ -113,10 +147,23 @@ class Terminal:
     def refresh_if_changed(self):
         if time.monotonic() < self.next_local_refresh: return
         self.next_local_refresh=time.monotonic()+2
+        self.expire_scan_results()
         if self.job or self.form or self.preview is not None or self.text_view is not None or self.result_view is not None or self.device_state is not None or self.review is not None or self.batch_settings is not None: return
         if self.last_stamp is not None and self.database_stamp()!=self.last_stamp:
             self.refresh_message='本地数据已更新（自动刷新）'
             self.start('list',['list'])
+
+    def expire_scan_results(self):
+        before={item.get('serial') for item in self.devices.values() if item.get('nearby')}
+        updated=merge_devices(self.devices,[])
+        if updated==self.devices:return
+        selected_key=list(self.devices)[self.selected] if self.devices and self.selected<len(self.devices) else None
+        self.devices=updated
+        after={item.get('serial') for item in updated.values() if item.get('nearby')}
+        self.marked.difference_update(before-after)
+        self.marked.intersection_update(item.get('serial') for item in updated.values() if not item.get('identity_conflict'))
+        self.selected=list(updated).index(selected_key) if selected_key in updated else min(self.selected,max(0,len(updated)-1))
+        self.needs_redraw=True
 
     def start(self, action, arguments):
         self.needs_redraw = True
@@ -170,11 +217,11 @@ class Terminal:
                         selected = self.selected_device()
                         selected_serial = selected.get('serial') if selected else None
                         self.devices = merge_devices(self.devices, payload, scan=True)
-                        self.marked.clear()
+                        self.marked.intersection_update(item.get('serial') for item in self.devices.values() if item.get('nearby') and not item.get('identity_conflict') and item.get('history_supported') is not False)
                         self.selected = min(self.selected, max(0, len(self.devices)-1))
                         if selected_serial and selected_serial in self.devices:
                             self.selected = list(self.devices).index(selected_serial)
-                        self.message = f'扫描完成：{len(payload)} 个 DROP；已清空旧勾选 · 空格选择 / A 全选 · Enter 下载所选'
+                        self.message = f'本次发现 {len(payload)} 台；近10分钟累计 {sum(bool(item.get("nearby")) for item in self.devices.values())} 台；保留有效勾选 · A全选 / u清空'
                         if any(item.get('auto_sync_error') for item in payload):self.message='身份核验登记已完成，但有自动同步未完成项，按l核对日志'
                     elif action == 'list':
                         self.last_stamp=self.list_stamp
@@ -439,7 +486,7 @@ class Terminal:
                 '首次读取最早仍保留的历史，以后只下载新增；设备中的旧记录不会自动删除。',
                 '编号未知：选择该行按 x 连接核验；已知编号仍会在下载前再次核对。',
                 '批量：空格勾选，A / Ctrl+A 全选附近可采集项，u 清空，Enter / a 下载所选。',
-                '没有勾选时，Enter 下载当前设备，a 提示先选择；重新扫描会清空旧勾选。',
+                '没有勾选时，Enter 下载当前设备，a 提示先选择；重扫累计最近10分钟发现，保留有效勾选；u清空。',
                 'j 设置本次并发数；默认 1，建议先尝试 2，更多连接数需现场验证。',
                 '列表和结果：↑↓ / PgUp / PgDn / Home / End 导航，结果页 r 只重试未完成项。',
                 'g 设置：已勾选时进入批量设置，否则读取当前设备；预览后再 Enter 写入。',
@@ -857,7 +904,7 @@ class Terminal:
         self.put(1,f'数据目录：{self.library.root}',curses.A_DIM)
         nearby=sum(bool(item.get('nearby')) for item in self.devices.values())
         scope=f'勾选的 {len(self.marked)} 台' if self.marked else '尚未勾选（A 全选）'
-        self.put(2,f'附近 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.parallel} · Enter / a 下载：{scope}')
+        self.put(2,f'近10分钟 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.parallel} · Enter / a 下载：{scope}')
         values=list(self.devices.values())
         if values:
             item=values[min(self.selected,len(values)-1)]
@@ -878,7 +925,7 @@ class Terminal:
                 elif progress.get('event')=='phase': state=PHASES.get(progress.get('phase'),state)
                 elif progress.get('event') in ('completed','configured'): state=STATUSES.get(progress.get('status'),state)
                 elif progress.get('event')=='error': state='未完成：'+progress.get('message','查看日志')
-            location='附近' if item.get('nearby') else '—'
+            location=('本次' if item.get('seen_this_scan') else '近期') if item.get('nearby') else '—'
             location+= ' '*max(0,4-text_width(location))
             pending=item.get('pending_records')
             display_serial=clip((item.get('management_code')+'/' if item.get('management_code') else '')+serial,18)
