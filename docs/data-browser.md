@@ -49,7 +49,7 @@ uv run --extra viewer kestrel.py --data-dir '/绝对路径/原数据目录' brow
 
 查询设有15秒执行预算，分页和图表限制Python内存用量；图表抽样仍需扫描选区。数据量大时请缩小时间范围。应用只监听127.0.0.1，并关闭Streamlit使用统计；没有做多用户认证，不应改绑公网。浏览器中的数据不会由本程序上传到云端。
 
-不增加缓存数据库、CSV镜像或新的运行数据目录。SQLite schema仍为4，浏览依赖属于可选扩展，不影响原有采集安装。
+不增加缓存数据库、CSV镜像或新的运行数据目录。SQLite schema现为5（浏览仍兼容只读旧库），浏览依赖属于可选扩展，不影响原有采集安装。
 
 ## 验证
 
@@ -64,3 +64,5 @@ uv run --locked --extra viewer python -B tests/run.py -q
 2026-10-28 本机验证：含可选组件的334项测试全部通过；不含组件的独立安装环境334项通过（4项UI测试跳过），安装版CLI/TUI冒烟通过。现有四台设备共37,220条正式观测，对每台完整时间范围查询计数、首屏和概览，约5–11ms；这是本机样本，不代表百万条性能或浏览器绘图耗时。GitHub CI另覆盖Linux Python 3.11/3.13/3.14、macOS Python 3.14、Python包审计及可选组件交互测试。
 
 实现入口为 `kestrel_drop/browse.py`（只读查询与服务启动）和 `kestrel_drop/viewer.py`（页面）。官方组件文档：[Streamlit](https://docs.streamlit.io/)、[AppTest](https://docs.streamlit.io/develop/api-reference/app-testing)。
+
+0.14 起设备选择显示管理编号，正文显示当前受试者代号及其语义提示；它仅帮助核对当前领用，不作为历史数据归属筛选，CSV观测导出不追加当前代号。

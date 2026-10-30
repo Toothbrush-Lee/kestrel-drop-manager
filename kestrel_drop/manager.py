@@ -94,6 +94,25 @@ class Library:
     def targets(self):
         return [item['serial'] for item in self.status()]
 
+    def metadata(self,serial,*,expected=None,**fields):
+        serial=serial_number(serial)
+        self.store.device(serial)
+        if fields:
+            from .metadata import clean
+            fields={key:clean(value,key) for key,value in fields.items()}
+            with writer_lock(self.root):
+                self._writable_store().update_metadata([(serial,fields)],expected={serial:expected} if expected else None)
+        return self.status(serial)[-1]
+
+    def import_labels(self,path,*,execute=False):
+        from .metadata import label_plan
+        if not execute:
+            plan=label_plan(self.store,path)
+            return {'devices':len(plan),'execute':False}
+        with writer_lock(self.root):
+            plan=label_plan(self.store,path);store=self._writable_store()
+            return store.update_metadata(plan)
+
     async def register(self, *, ble_id=None, serial=None, timeout=15):
         identity = await devices.identify(ble_id, serial=serial, timeout=timeout)
         devices.require_identity(identity, expected=serial)
@@ -351,6 +370,17 @@ def parser():
     ap.add_argument('--events-json', action='store_true', help='输出版本化 JSON Lines 事件，供 TUI / 自动化使用')
     sub = ap.add_subparsers(dest='command')
     sub.add_parser('tui', help='交互式终端界面')
+    metadata=sub.add_parser('metadata',help='查看或保存本地管理编号和当前受试者代号；不连接设备')
+    metadata.add_argument('serial',type=serial_number)
+    metadata.add_argument('--management-code',default=None)
+    metadata.add_argument('--participant-code',default=None)
+    metadata.add_argument('--expect-management-code',default=None,help='并发保护：要求保存前的管理编号匹配')
+    metadata.add_argument('--expect-participant-code',default=None,help='并发保护：要求保存前的受试者代号匹配')
+    labels=sub.add_parser('labels-import',help='核对编号CSV；加--execute才保存')
+    labels.add_argument('source',type=Path)
+    labels.add_argument('--execute',action='store_true')
+    labels=sub.add_parser('labels-export',help='导出当前设备编号与受试者代号清单')
+    labels.add_argument('output',type=Path)
     browse=sub.add_parser('browse',help='启动本机只读数据浏览前端（可选viewer组件）')
     browse.add_argument('--port',type=int,default=8501)
     browse.add_argument('--no-open',action='store_true',help='只启动服务，不自动打开浏览器')
@@ -477,6 +507,15 @@ def _run(args):
                 events.emit('error', **describe(DeviceMismatch('设备型号或编号读取未通过核验：' + str(result['identity_errors']))))
                 events.result(result)
                 return 2
+        elif args.command=='metadata':
+            fields={key:getattr(args,key) for key in ('management_code','participant_code') if getattr(args,key) is not None}
+            expected={key:getattr(args,'expect_'+key) for key in ('management_code','participant_code') if getattr(args,'expect_'+key) is not None}
+            result=library.metadata(args.serial,expected=expected,**fields)
+        elif args.command=='labels-import':
+            result=library.import_labels(args.source,execute=args.execute)
+        elif args.command=='labels-export':
+            from .metadata import export_labels
+            result=export_labels(library.store,args.output)
         elif args.command == 'register':
             result = asyncio.run(library.register(ble_id=args.ble_id, serial=args.serial, timeout=args.timeout))
         elif args.command in ('list', 'status'):

@@ -1,5 +1,6 @@
 """Official DROP interfaces, migration, bounded concurrency and write uncertainty."""
 import asyncio
+from legacy_schema import remove_metadata
 from contextlib import redirect_stdout, redirect_stderr
 import io
 import json
@@ -196,7 +197,7 @@ class RevisionTests(unittest.TestCase):
             with store.transaction() as c:
                 c.execute('DROP VIEW device_overview');c.execute('DROP TABLE device_actions')
                 c.execute('UPDATE observations SET heat_index_c=?',(legacy['heat_index_c'],))
-                c.execute("UPDATE transfers SET decoder_version='d3-21-v1'");c.execute('PRAGMA user_version=3')
+                c.execute("UPDATE transfers SET decoder_version='d3-21-v1'");remove_metadata(c);c.execute('PRAGMA user_version=3')
             Store(path).check();self.assertEqual(Store(path).overview()[0]['records'],1)
             Store(path,create=True).check()
             self.assertEqual(Store(path).query('3')[0]['heat_index_c'],360)
@@ -371,7 +372,7 @@ class ProtocolEdgeTests(unittest.IsolatedAsyncioTestCase):
                 c.execute('UPDATE observations SET heat_index_c=-295.36')
                 c.execute("UPDATE transfers SET decoder_version='d3-21-v1'")
                 c.execute("CREATE TRIGGER fail_upgrade BEFORE UPDATE ON transfers BEGIN SELECT RAISE(ABORT,'injected'); END")
-                c.execute('PRAGMA user_version=3')
+                remove_metadata(c);c.execute('PRAGMA user_version=3')
             with self.assertRaises(sqlite3.IntegrityError):Store(path,create=True)
             old=Store(path);old.check()
             self.assertEqual(old.query('3')[0]['heat_index_c'],-295.36)

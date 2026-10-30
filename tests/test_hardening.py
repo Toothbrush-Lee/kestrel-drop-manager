@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+from legacy_schema import remove_metadata
 import time
 import sys
 import tempfile
@@ -86,7 +87,7 @@ class StorageHardeningTests(unittest.TestCase):
         path=self.root/'old.sqlite';self.store.backup(path)
         with closing(sqlite3.connect(path)) as c,c:
             c.execute('DROP VIEW device_overview');c.execute('DROP TABLE device_actions')
-            c.execute('PRAGMA user_version=3')
+            remove_metadata(c);c.execute('PRAGMA user_version=3')
             c.execute("UPDATE transfers SET decoder_version='d3-21-v1'")
         # Fixture's heat-index fits both decoder revisions.
         before=path.read_bytes();self.assertEqual(Store(path).check()['records'],3)

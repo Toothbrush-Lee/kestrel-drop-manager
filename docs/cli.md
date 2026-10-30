@@ -1,6 +1,6 @@
 # 命令参考
 
-适用于 0.13.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
+适用于 0.14.0。以下命令在项目目录运行，把示例设备编号、BLE 地址和输出路径换成自己的值。路径含空格时加引号。完整参数以 `uv run kestrel.py --help` 和 `uv run kestrel.py 子命令 --help` 为准。
 
 ## 基本约定
 
@@ -162,3 +162,7 @@ uv run --extra viewer kestrel.py --data-dir /绝对路径/数据目录 browse --
 ```
 
 `browse` 使用可选 Streamlit 组件，端口默认8501，仅监听127.0.0.1。`--no-open` 不自动打开浏览器；Ctrl+C关闭。保持终端运行，访问页面上显示的本机地址。只读已存在的 `library.sqlite`，不会建空库、迁移或连接设备；不支持 `--events-json`。独立采集运行包不含此扩展，详见[浏览指南](data-browser.md)。
+
+## 本地设备资料与领用清单
+
+`metadata 序列号 [--management-code 管理编号] [--participant-code 受试者代号]`：无修改参数时只读，带参数离线保存，显式空字符串清除。`labels-import CSV路径` 只预览校验，加 `--execute` 原子导入已登记设备的编号；空白受试者列不覆盖已有代号。`labels-export 输出CSV路径` 导出当前资料清单，不覆盖旧文件。`actions 序列号` 可查看含 `requested.local_metadata` 的变更记录。完整规则见[设备资料](device-metadata.md)，当前代号不代表全部历史归属。

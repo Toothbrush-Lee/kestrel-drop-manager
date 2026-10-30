@@ -158,7 +158,7 @@ class Terminal:
             self.action = None
             self.message = ('已取消；已落盘数据保留，可再次下载' if job.cancelled else
                             '操作完成' if value == 0 else f'操作未完成（退出码 {value}），请查看下方日志')
-            if (value == 0 or (action in ('list', 'scan') and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'blink', 'live', 'timing'):
+            if (value == 0 or (action in ('list', 'scan') and value == 2)) and action in ('scan', 'list', 'records', 'backup', 'export', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'blink', 'live', 'timing', 'metadata'):
                 try:
                     payload = job.payload
                     if payload is None:
@@ -205,6 +205,9 @@ class Terminal:
                             self.selected = list(self.devices).index(serial)
                         self.message = (f'{payload["device_type"]} · {serial} 已核验登记；'
                                         + ('Enter 下载' if payload['history_supported'] else '历史格式待适配，可继续管理其他设备'))
+                    elif action=='metadata':
+                        self.devices=merge_devices(self.devices,[payload])
+                        self.message='本地设备资料已保存；不改变设备设置或历史观测归属'
                     elif action == 'backup':
                         self.message = f'数据库备份完成：{payload["backup"]}（按 l 查看完整路径）'
                     elif action == 'migrate':
@@ -225,7 +228,7 @@ class Terminal:
                         self.message = f'已导入完整档案：{payload["database"]}（按 l 查看完整路径）'
                 except (ValueError, TypeError, KeyError) as exc:
                     self.message = f'无法读取任务结果：{exc}'
-            if action in ('download', 'import', 'migrate', 'configure', 'register', 'identify', 'set', 'set-batch'):
+            if action in ('download', 'import', 'migrate', 'configure', 'register', 'identify', 'set', 'set-batch', 'metadata'):
                 self.refresh_message = self.message
                 self.start('list', ['list'])
             if action in ('download','set-batch') or (value and action != 'list'):
@@ -286,6 +289,13 @@ class Terminal:
                      'cursors': [len(str(value)) for _,value in fields],
                      'target': self.device_state['serial'] if action.startswith('set_') and self.device_state else (self.selected_device() or {}).get('serial')}
 
+    def open_metadata(self,device):
+        if not device or not device.get('serial') or not device.get('database'):
+            self.message='请先按 x 核验登记此设备，再填写本地资料'
+            return
+        self.open_form(f"本地资料 · 序列号 {device['serial']}", [('管理编号（可空）',device.get('management_code','')),('当前受试者代号（可空）',device.get('participant_code',''))],'metadata')
+        self.form['target']=device['serial'];self.form['before']=dict(device)
+
     def submit(self):
         values = [field[1].strip() for field in self.form['fields']]
         action = self.form['action']
@@ -304,6 +314,17 @@ class Terminal:
                 interval=int(values[0])
                 if not 2<=interval<=86400:raise ValueError('预期间隔须为2–86400秒')
                 if self.start('timing',['timing',self.form['target'],'--interval',str(interval)]) is False:return
+            elif action=='metadata':
+                from .metadata import clean
+                fields={key:clean(value,key) for key,value in zip(('management_code','participant_code'),values)}
+                old=self.form['before']
+                self.review={'action':'metadata','serial':self.form['target'],'label':'本地管理编号 / 当前受试者代号',
+                    'old':f"{old.get('management_code') or '未编号'} / {old.get('participant_code') or '未分配'}",
+                    'new':f"{fields['management_code'] or '未编号'} / {fields['participant_code'] or '未分配'}",
+                    'impact':'仅保存当前领用信息并记录变更；不会将过去观测归给新受试者，不连接蓝牙。',
+                    'arguments':['metadata',self.form['target'],'--management-code',fields['management_code'],'--participant-code',fields['participant_code'],
+                        '--expect-management-code',old.get('management_code',''),'--expect-participant-code',old.get('participant_code','')]}
+                return
             elif action == 'add':
                 from .manager import serial_number
                 serial = serial_number(values[0])
@@ -372,6 +393,7 @@ class Terminal:
             self.text_offset=max(0,len(self.wrapped_text())-self.screen.getmaxyx()[0]+4)
         else:
             self.text_view=[
+                'z 编辑当前设备的本地管理编号和受试者代号；预览后确认保存，不连接蓝牙。',
                 '快速开始：s 扫描 15 秒 → ↑↓ 选择 → Enter 下载 → e 导出。',
                 '已知地址按目标定位，发现即连接；默认扫描 15 秒。',
                 't 离线诊断采样间隔和整点相位；校时回读成功不代表整点采样。',
@@ -445,7 +467,7 @@ class Terminal:
                 if self.start(action,self.review['arguments']) is not False:
                     self.review=None;self.form=None
                     if action=='set-batch': self.batch_settings=None
-                    elif self.device_state is not None: self.device_state['read_stale']=True
+                    elif action=='set' and self.device_state is not None: self.device_state['read_stale']=True
                 else: self.review['error']=self.message
             return True
         if self.form:
@@ -481,6 +503,10 @@ class Terminal:
                 interval=(device.get('settings') or {}).get('interval_seconds') or 300
                 self.open_form('只读采样时间诊断（不会校时或改数据）',[('预期采样间隔（秒）',interval)],'timing')
                 self.form['target']=device['serial']
+            return True
+        if key=='z' and not self.job and self.batch_settings is None:
+            device=self.devices.get((self.device_state or {}).get('serial')) or self.selected_device()
+            self.open_metadata(device)
             return True
         if self.batch_settings is not None:
             if key in ('q','\x1b'): self.batch_settings=None
@@ -714,8 +740,8 @@ class Terminal:
         values=list(self.devices.values())
         if values:
             item=values[min(self.selected,len(values)-1)]
-            self.put(3,f'当前 {self.selected+1}/{len(values)}：{item.get("serial") or "编号待核验"} · '+('已核验' if item.get('identity_verified') else '连接后核验编号'),curses.A_DIM)
-        self.put(4,'选 型号  设备编号          附近    已入库    未确认   状态 / 末条记录时间',curses.A_BOLD)
+            self.put(3,f'当前 {self.selected+1}/{len(values)}：{item.get("management_code") or "未编号"} · {item.get("serial") or "序列号待核验"} · 受试者 {item.get("participant_code") or "未分配"} · z 编辑资料',curses.A_DIM)
+        self.put(4,'选 型号  管理编号/序列号          附近    已入库    未确认   状态 / 末条记录时间',curses.A_BOLD)
         visible=max(2,min(8,height-15))
         top=max(0,self.selected-visible+1)
         for index,item in enumerate(values[top:top+visible],top):
@@ -734,7 +760,8 @@ class Terminal:
             location='附近' if item.get('nearby') else '—'
             location+= ' '*max(0,4-text_width(location))
             pending=item.get('pending_records')
-            line=(f'{"*" if item.get("serial") in self.marked else " "}  {kind:<4} {serial:<18} {location} '
+            display_serial=clip((item.get('management_code')+'/' if item.get('management_code') else '')+serial,18)
+            line=(f'{"*" if item.get("serial") in self.marked else " "}  {kind:<4} {display_serial:<18} {location} '
                   f'{item.get("database_records",item.get("committed_records","—")):>7}  '
                   f'{pending if pending is not None else "—":>7}  {state}')
             self.put(5+index-top,line,curses.A_REVERSE if index==self.selected else 0)
@@ -752,7 +779,7 @@ class Terminal:
         log_start=row+4
         for offset,line in enumerate(list(self.logs)[-max(1,height-log_start-3):]):self.put(log_start+offset,line,curses.A_DIM)
         self.put(height-2,'Enter 下载所选/当前  s 扫描  空格勾选  A 全选  a 下载所选  g 设置')
-        self.put(height-1,'t 时间诊断  u 清空  j 并发  b 备份  l 日志  ? 帮助  q 退出',curses.A_DIM)
+        self.put(height-1,'z 设备资料  t 时间诊断  u 清空  j 并发  b 备份  l 日志  ? 帮助  q 退出',curses.A_DIM)
 
     def draw_preview(self,height,width):
         self.screen.erase()
@@ -827,6 +854,7 @@ class Terminal:
             'set_name':'仅支持1–20个可打印ASCII字符，如 Lab-01；真实设备编号不会改变。',
             'set_update':'范围2–60秒，影响实时刷新，与历史采样间隔分开。',
             'set_altitude':'单位为米，可为负值；只用于气压计算，不改出厂校准。',
+            'metadata':'字母数字开头，可含 _ . -；管理编号最多32字符、受试者代号64字符。留空会清除当前值；不填真实姓名。',
             'export':'不筛选时间可直接按 Enter 跳过；结束日期包含当天整天。'}
         start=4+min(count,len(form['fields']))*3
         for row,line in enumerate(wrap_lines(help_text.get(form['action'],''),width-3),start):
@@ -842,7 +870,7 @@ class Terminal:
     def draw_review(self,height,width):
         self.screen.erase()
         review=self.review
-        self.put(0,'检查设备变更',curses.A_BOLD)
+        self.put(0,'检查本地设备资料' if review.get('action')=='metadata' else '检查设备变更',curses.A_BOLD)
         if review.get('targets'):
             self.put(1,f"{len(review['targets'])} 台 · {review['label']}",curses.A_BOLD)
             for row,line in enumerate(wrap_lines('准备写入：'+review['new'],width-3)[:2],2):self.put(row,line)
@@ -852,14 +880,14 @@ class Terminal:
         else:
             lines=[f'设备编号：{review["serial"]}',f'修改项目：{review["label"]}',
                    f'上次读取：{review["old"]}',f'准备写入：{review["new"]}','',review['impact'],
-                   '写入前会重新核验设备，并以设备最新设置为基础只修改此项。']
+                   ('只保存到本机 SQLite，不校时、不改设备名称。' if review.get('action')=='metadata' else '写入前会重新核验设备，并以设备最新设置为基础只修改此项。')]
             if '--time' in review['arguments'] and 'now' in review['arguments']:
                 lines.append('预览时电脑本地时间：'+datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'))
             wrapped=[line for text in lines for line in wrap_lines(text,width-3)]
             for row,line in enumerate(wrapped[:height-5],2):self.put(row,line)
         if review.get('error'):self.put(height-4,review['error'],curses.A_BOLD)
-        self.put(height-2,'Enter 写入并回读验证 · Esc 返回修改',curses.A_BOLD)
-        self.put(height-1,self.message if self.job else '仅此步骤会发送配置；关闭预览不会改变设备',curses.A_DIM)
+        self.put(height-2,'Enter 保存本地资料 · Esc 返回修改' if review.get('action')=='metadata' else 'Enter 写入并回读验证 · Esc 返回修改',curses.A_BOLD)
+        self.put(height-1,'仅当前领用信息，不改变历史观测归属。' if review.get('action')=='metadata' else self.message if self.job else '仅此步骤会发送配置；关闭预览不会改变设备',curses.A_DIM)
 
     def draw_result(self,height,width):
         self.screen.erase()

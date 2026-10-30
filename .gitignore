@@ -27,3 +27,6 @@ __pycache__/
 /build/
 /dist/
 *.egg-info/
+
+# Local label sheets and subject assignment exports; never publish participant codes.
+/outputs/

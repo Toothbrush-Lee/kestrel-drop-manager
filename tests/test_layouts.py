@@ -1,5 +1,6 @@
 """Captured layouts and reversible schema-2 upgrade boundaries."""
 import sqlite3
+from legacy_schema import remove_metadata
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +41,7 @@ class UpgradeTests(unittest.TestCase):
                     for field in ['relative_humidity_pct','station_pressure_hpa','heat_index_c','dew_point_c','density_altitude_m_raw']:
                         statement=statement.replace(field+' REAL,',field+' REAL NOT NULL,')
                 c.execute(statement)
+            remove_metadata(c)
             c.execute('PRAGMA user_version=2');c.execute(f'PRAGMA application_id={APPLICATION_ID}')
         store=Store(self.path);store.ensure_device('3','D3')
         transfer=store.begin_transfer('3',0,1)
@@ -61,7 +63,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(len(backups),1);Store(backups[0]).check()
         self.assertEqual(store.query('3'),Store(backups[0]).query('3'))
         self.assertEqual(len(store.query('3')),1)
-        with store.connect() as c: self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],4)
+        with store.connect() as c: self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],5)
         store.ensure_device('1','D1')
         t=store.begin_transfer('1',0,1)
         row=protocol.decode_record(RAW[:9],block=0,position=0,model='D1')

@@ -55,7 +55,7 @@ class Browser:
 
     def catalog(self):
         with self.snapshot() as c:
-            return [dict(r) for r in c.execute('''SELECT d.serial,d.model,d.alias,
+            return [dict(r) for r in c.execute('SELECT '+self.store.metadata_columns(c)+''',d.serial,d.model,d.alias,
                 count(o.absolute_cursor) AS records,min(o.timestamp_device_local) AS first_time,
                 max(o.timestamp_device_local) AS last_time FROM devices d JOIN histories h USING(serial)
                 LEFT JOIN observations o ON o.history_id=h.id GROUP BY d.serial ORDER BY d.serial''')]

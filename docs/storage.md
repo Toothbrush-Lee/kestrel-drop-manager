@@ -1,4 +1,4 @@
-# 存储设计：schema 4 / 0.8.0
+# 存储设计：schema 5 / 0.14.0
 
 SQLite 是运行时唯一权威来源。CSV 仅作导出或旧档案导入；旧格式恢复代码只在迁移副本及底层诊断工具中使用。
 
@@ -94,3 +94,11 @@ schema 1 / CSV 旧档案迁移是显式操作。当前和旧版下载锁都要�
 status 的 pending_records 是当前 receiving/interrupted 尝试的记录数；superseded_records 是首次重试保留的旧尝试证据。resumable_records 只表示增量恢复可复用的记录数，首次下载恒为 0，必须从零重新请求。旧证据仍参与完整检查，成功发布当前完整历史后才一并清理，不提前删除。
 
 已完成事务后最终 ACK 发送失败，结果为 saved_warning（退出码 0），附 completion_ack_failed 提醒；此时正式记录、游标和校验都已提交，不属于 pending，也不自动重复下载。块写入或完成事务失败仍按原路径失败，不能借此状态绕过校验。取消不转换为成功。
+
+## schema 5 本地设备资料
+
+`devices.management_code` 是可选且非空值唯一的管理编号，`participant_code` 是可选的当前受试者代号（非唯一，允许同一人多台设备）。两者都是 TEXT，空字符串表示未编号/未分配；序列号仍为主键，alias仍为原有别名。`device_overview` 展示新字段。
+
+资料更新与 `device_actions` 审计在同一个事务中完成，`requested.local_metadata` 区分本地资料操作与设备配置。before/after保存旧新值，UTC记录操作时刻；同值不新增审计。它记录登记操作时间，不能代替实际佩戴或观测时段。不会在observations上重复存代号，也不按当前devices关联改写旧数据。
+
+4→5首次写入前创建 `backups/schema4-before-upgrade-*.sqlite` 独立备份，完整检查后，在一个事务中添加列、部分唯一索引与更新视图。DDL失败不留下半套字段。2/3先按历史流程到4（保存原版本备份），再完成资料升级。只读兼容2/3/4/5，旧版程序无法打开5。

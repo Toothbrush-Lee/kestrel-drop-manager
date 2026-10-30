@@ -134,8 +134,8 @@ def migrate(root):
         if database.exists():
             with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as connection:
                 version = connection.execute('PRAGMA user_version').fetchone()[0]
-            if version in (2, 3, SCHEMA_VERSION):
-                result = Store(database, create=version in (2, 3)).check()
+            if version in (2, 3, 4, SCHEMA_VERSION):
+                result = Store(database, create=version in (2, 3, 4)).check()
                 leftovers = []
                 for manifest_path in (root / 'legacy').glob('migration-*/manifest.json'):
                     meta = json.loads(manifest_path.read_text())

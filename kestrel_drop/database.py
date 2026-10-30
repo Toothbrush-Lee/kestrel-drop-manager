@@ -1,4 +1,4 @@
-"""Single durable authority for observations and BLE recovery (schema 4).
+"""Single durable authority for observations and BLE recovery (schema 5).
 
 Block transactions commit before ACK. Final publication, cursor advancement and
 pending cleanup are one transaction. Read operations never repair or reindex.
@@ -22,12 +22,13 @@ from .errors import MigrationRequired
 from .devices import canonical_model, model_type, capabilities, serial_number
 from .layouts import MEASUREMENTS, FIELDS, profile
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 APPLICATION_ID = 0x4B445250
 DECODER = 'd3-21-v2'
 
 SCHEMA = (
-    '''CREATE TABLE devices (serial TEXT PRIMARY KEY, model TEXT NOT NULL, alias TEXT NOT NULL DEFAULT '')''',
+    '''CREATE TABLE devices (serial TEXT PRIMARY KEY, model TEXT NOT NULL, alias TEXT NOT NULL DEFAULT '',
+        management_code TEXT NOT NULL DEFAULT '', participant_code TEXT NOT NULL DEFAULT '')''',
     '''CREATE TABLE histories (
         id INTEGER PRIMARY KEY, serial TEXT NOT NULL REFERENCES devices(serial),
         generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0),
@@ -60,8 +61,9 @@ SCHEMA = (
         started_utc TEXT NOT NULL, finished_utc TEXT, requested_json TEXT NOT NULL,
         before_json TEXT NOT NULL, after_json TEXT, error TEXT,
         status TEXT NOT NULL CHECK(status IN ('started','verified','failed_or_unknown')))''',
+    "CREATE UNIQUE INDEX devices_management_code ON devices(management_code) WHERE management_code<>''",
     '''CREATE VIEW device_overview AS
-        SELECT d.serial,d.model,d.alias,h.generation,h.first_cursor,h.next_cursor,
+        SELECT d.serial,d.model,d.alias,d.management_code,d.participant_code,h.generation,h.first_cursor,h.next_cursor,
         (SELECT count(*) FROM observations o WHERE o.history_id=h.id) AS records,
         (SELECT timestamp_device_local FROM observations o WHERE o.history_id=h.id ORDER BY absolute_cursor DESC LIMIT 1) AS last_record_time,
         (SELECT max(finished_utc) FROM transfers t WHERE t.history_id=h.id AND status='completed') AS last_download_utc
@@ -96,7 +98,7 @@ def checked_rows(rows, model='D3'):
     return list(iter_checked_rows(rows, model))
 
 
-SCHEMA_OBJECTS = {re.match(r'CREATE (?:TABLE|INDEX|VIEW) (\w+)', sql)[1]: sql for sql in SCHEMA}
+SCHEMA_OBJECTS = {re.match(r'CREATE (?:UNIQUE )?(?:TABLE|INDEX|VIEW) (\w+)', sql)[1]: sql for sql in SCHEMA}
 
 
 @lru_cache(maxsize=1)
@@ -127,6 +129,9 @@ class Store:
                         raise RuntimeError('数据库来源不受支持，拒绝升级')
                     self._check_schema(connection)
                     self._upgrade_v2(connection, version=version)
+                if connection.execute('PRAGMA user_version').fetchone()[0] == 4:
+                    self._check_schema(connection)
+                    self._upgrade_metadata(connection,backup=version not in (2,3))
                 if version == 0:
                     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone():
                         raise RuntimeError('数据库格式不受支持，拒绝覆盖')
@@ -146,7 +151,7 @@ class Store:
         with self.connect() as connection:
             if connection.execute('PRAGMA user_version').fetchone()[0] == 1:
                 raise MigrationRequired('旧版 SQLite 需要运行 migrate；文件未被覆盖')
-            if (connection.execute('PRAGMA user_version').fetchone()[0] not in (2, 3, SCHEMA_VERSION) or
+            if (connection.execute('PRAGMA user_version').fetchone()[0] not in (2, 3, 4, SCHEMA_VERSION) or
                     connection.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID):
                 raise RuntimeError('数据库需要迁移或版本不受支持；旧版本请运行 migrate，文件未被覆盖')
 
@@ -163,6 +168,7 @@ class Store:
             for name in ('transfers_history', 'device_actions', 'device_overview'):
                 statement = SCHEMA_OBJECTS[name]
                 if name == 'transfers_history': statement = statement.replace('CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS ', 1)
+                if name=='device_overview':statement=statement.replace('d.management_code,d.participant_code,','')
                 connection.execute(statement)
             # Recompute the corrected signed 24-bit heat index from immutable raw bytes.
             for h in connection.execute('SELECT h.id,d.model FROM histories h JOIN devices d USING(serial)'):
@@ -173,7 +179,20 @@ class Store:
                         updates = ((layout.decode(r['record_raw'], block=r['block'], position=r['position_in_block'])['heat_index_c'], h['id'], r['absolute_cursor']) for r in batch)
                         connection.executemany('UPDATE observations SET heat_index_c=? WHERE history_id=? AND absolute_cursor=?', updates)
                 connection.execute('UPDATE transfers SET decoder_version=? WHERE history_id=?', (layout.decoder,h['id']))
-            connection.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+            connection.execute('PRAGMA user_version=4')
+
+    def _upgrade_metadata(self, connection, *, backup=True):
+        import uuid
+        directory=self.path.parent/'backups';directory.mkdir(exist_ok=True)
+        if backup:Store(self.path).backup(directory/f'schema4-before-upgrade-{uuid.uuid4().hex[:12]}.sqlite')
+        with connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute("ALTER TABLE devices ADD COLUMN management_code TEXT NOT NULL DEFAULT ''")
+            connection.execute("ALTER TABLE devices ADD COLUMN participant_code TEXT NOT NULL DEFAULT ''")
+            connection.execute(SCHEMA_OBJECTS['devices_management_code'])
+            connection.execute('DROP VIEW device_overview')
+            connection.execute(SCHEMA_OBJECTS['device_overview'])
+            connection.execute('PRAGMA user_version=5')
 
     def _copy_v2_tables(self, connection):
         for name in ('pending_blocks', 'observations'):
@@ -186,11 +205,15 @@ class Store:
     def _check_schema(self, connection):
         version = connection.execute('PRAGMA user_version').fetchone()[0]
         required = set(SCHEMA_OBJECTS)
+        if version<5:required.discard('devices_management_code')
         if version in (2, 3): required -= {'device_actions', 'device_overview'}
         actual = {row[1]: (row[0], row[2]) for row in connection.execute(
             "SELECT type,name,tbl_name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
         for name in sorted(required):
             kind, owner, expected = schema_contract()[name]
+            if version<5 and name in ('devices','device_overview'):
+                expected=tuple(row for row in expected if row[1] not in ('management_code','participant_code'))
+                expected=tuple((i,*row[1:]) for i,row in enumerate(expected))
             if actual.get(name) != (kind, owner):
                 raise RuntimeError(f'数据库结构缺失或类型错误：{name}（schema {version}）')
             pragma = 'index_info' if kind == 'index' else 'table_info'
@@ -198,6 +221,11 @@ class Store:
             if version == 2 and name == 'observations':
                 legacy_required = {'relative_humidity_pct', 'station_pressure_hpa', 'heat_index_c', 'dew_point_c', 'density_altitude_m_raw'}
                 columns = tuple((*row[:3], 0, *row[4:]) if row[1] in legacy_required else row for row in columns)
+            if name=='devices_management_code':
+                index=next(row for row in connection.execute('PRAGMA index_list(devices)') if row[1]==name)
+                sql=connection.execute("SELECT sql FROM sqlite_master WHERE name=?",(name,)).fetchone()[0]
+                if not index[2] or not index[4] or re.sub(r'\s+','',sql).lower()!=re.sub(r'\s+','',SCHEMA_OBJECTS[name]).lower():
+                    raise RuntimeError('管理编号唯一索引不符合 schema 5')
             if columns != expected:
                 raise RuntimeError(f'数据库列或索引不符合 schema {version}：{name}')
 
@@ -248,6 +276,38 @@ class Store:
             else:
                 connection.execute('INSERT INTO devices(serial,model) VALUES(?,?)', (serial, model))
                 connection.execute('INSERT INTO histories(serial) VALUES(?)', (serial,))
+
+    @staticmethod
+    def metadata_columns(connection):
+        names={row[1] for row in connection.execute('PRAGMA table_info(devices)')}
+        return ','.join('d.'+key if key in names else "'' AS "+key for key in ('management_code','participant_code'))
+
+    def update_metadata(self, updates, *, expected=None):
+        """Apply an already validated batch atomically; audit local changes, never BLE."""
+        from .metadata import clean
+        updates=[(serial_number(serial),{key:clean(value,key) for key,value in fields.items()}) for serial,fields in updates]
+        if len({serial for serial,_ in updates})!=len(updates):raise ValueError('批次中序列号重复')
+        with self.transaction() as c:
+            changed=[]
+            for serial,fields in updates:
+                row=c.execute('SELECT * FROM devices WHERE serial=?',(serial,)).fetchone()
+                if row is None:raise ValueError(f'设备 {serial} 尚未登记，请先核验身份')
+                before={key:row[key] for key in ('management_code','participant_code')}
+                if expected and serial in expected and any(before[key]!=value for key,value in expected[serial].items()):
+                    raise ValueError('资料已被其他操作更新，请刷新本地列表后重新编辑')
+                after={**before,**fields}
+                if after==before:continue
+                owner=c.execute("SELECT serial FROM devices WHERE management_code=? AND management_code<>'' AND serial<>?",(after['management_code'],serial)).fetchone()
+                if owner:raise ValueError(f"管理编号 {after['management_code']} 已被 {owner['serial']} 占用")
+                if re.match(r'^D[123]-',after['management_code']) and after['management_code'][:2]!=model_type(row['model']):
+                    raise ValueError('管理编号的D1/D2/D3前缀与设备型号不符')
+                c.execute('UPDATE devices SET management_code=?,participant_code=? WHERE serial=?',
+                          (after['management_code'],after['participant_code'],serial))
+                stamp=utcnow()
+                c.execute("INSERT INTO device_actions(serial,started_utc,finished_utc,requested_json,before_json,after_json,status) VALUES(?,?,?,?,?,?,'verified')",
+                          (serial,stamp,stamp,json.dumps({'local_metadata':fields},ensure_ascii=False),json.dumps(before,ensure_ascii=False),json.dumps(after,ensure_ascii=False)))
+                changed.append(serial)
+            return {'updated':len(changed),'serials':changed}
 
     def _pending(self, connection, history):
         return self._pending_state(connection, history, collect=True)
@@ -393,7 +453,7 @@ class Store:
         result = []
         with self.connect() as connection:
             connection.execute('BEGIN')
-            statement = 'SELECT h.*, d.model FROM histories h JOIN devices d USING(serial)'
+            statement = 'SELECT h.*, d.model,d.alias,'+self.metadata_columns(connection)+' FROM histories h JOIN devices d USING(serial)'
             values = ()
             if serial is not None:
                 statement += ' WHERE h.serial=?'
@@ -401,7 +461,8 @@ class Store:
             histories = connection.execute(statement + ' ORDER BY serial,generation', values).fetchall()
             for h in histories:
                 count, earliest, latest = connection.execute('SELECT count(*),(SELECT timestamp_device_local FROM observations WHERE history_id=? ORDER BY absolute_cursor LIMIT 1),(SELECT timestamp_device_local FROM observations WHERE history_id=? ORDER BY absolute_cursor DESC LIMIT 1) FROM observations WHERE history_id=?', (h['id'], h['id'], h['id'])).fetchone()
-                item = {'serial': h['serial'], 'model': h['model'], 'history_id': h['id'],
+                item = {'serial': h['serial'], 'model': h['model'], 'alias':h['alias'],
+                        'management_code':h['management_code'],'participant_code':h['participant_code'], 'history_id': h['id'],
                         'committed_records': count, 'database_records': count,
                         'first_cursor': h['first_cursor'], 'next_cursor': h['next_cursor'],
                         'first_timestamp': earliest, 'last_timestamp': latest,
@@ -507,7 +568,7 @@ class Store:
 
     def overview(self):
         with self.connect() as connection:
-            statement = 'SELECT * FROM device_overview ORDER BY serial' if connection.execute("SELECT 1 FROM sqlite_master WHERE type='view' AND name='device_overview'").fetchone() else SCHEMA[-1].split(' AS\n',1)[1]+' ORDER BY d.serial'
+            statement = 'SELECT * FROM device_overview ORDER BY serial' if connection.execute("SELECT 1 FROM sqlite_master WHERE type='view' AND name='device_overview'").fetchone() else SCHEMA[-1].split(' AS\n',1)[1].replace('d.management_code,d.participant_code,','')+' ORDER BY d.serial'
             return [dict(row) for row in connection.execute(statement)]
 
     def actions(self, serial, limit=20):

@@ -25,9 +25,10 @@ def render(root):
     if not catalog:st.info('档案中尚无设备；请先完成采集。');return
     by_serial={item['serial']:item for item in catalog}
     with st.sidebar:
-        serial=st.selectbox('设备',list(by_serial),format_func=lambda key:f"{key} · {by_serial[key]['model']}"+(f" · {by_serial[key]['alias']}" if by_serial[key]['alias'] else ''),key='device')
+        serial=st.selectbox('设备',list(by_serial),format_func=lambda key:f"{by_serial[key]['management_code'] or key} · {key} · {by_serial[key]['model']}"+(f" · {by_serial[key]['alias']}" if by_serial[key]['alias'] else ''),key='device')
     device=by_serial[serial]
-    st.caption(f"设备 {serial} · {device['model']}")
+    st.caption(f"设备 {device['management_code'] or '未编号'} · {serial} · {device['model']}")
+    st.caption(f"当前受试者代号：{device['participant_code'] or '未分配'}（仅当前领用信息，不代表历史观测归属）")
     if not device['records']:st.info('此设备已登记，尚无正式观测。');return
     first=datetime.fromisoformat(device['first_time']).replace(second=0);last=datetime.fromisoformat(device['last_time']).replace(second=0)
     start_key='start_'+serial;end_key='end_'+serial
