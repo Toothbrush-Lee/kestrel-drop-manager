@@ -99,3 +99,60 @@ def batch_setting_change(action, value, targets):
     if action == 'batch_set_time' and value == 'now':
         single['new'] = '每台实际写入时的电脑本地时间（逐台同步）'
     return single
+
+
+def retry_batch_settings_plan(arguments,outcomes,devices):
+    """Prepare a manual confirmation for only unverified original targets."""
+    import math
+    from .batch_settings import targets
+    if not isinstance(arguments,(list,tuple)) or not all(isinstance(value,str) for value in arguments) or not isinstance(outcomes,(list,tuple)):raise ValueError('批量任务或结果格式不完整，请核对日志')
+    if not arguments or arguments[0]!='set-batch':raise ValueError('不是批量设置任务')
+    multiple={'--serials','--ble-ids'}
+    single={'--interval','--wrap','--update-seconds','--time','--timeout'}
+    switches={'--execute','--allow-schedule-shift'}
+    options={};index=1
+    while index<len(arguments):
+        flag=arguments[index];index+=1
+        if flag not in multiple|single|switches or flag in options:raise ValueError('原批量设置参数无效，请返回重新设置')
+        if flag in switches:options[flag]=True;continue
+        start=index
+        while index<len(arguments) and not arguments[index].startswith('--'):index+=1
+        values=arguments[start:index]
+        if not values or (flag in single and len(values)!=1):raise ValueError('原批量设置参数不完整，请返回重新设置')
+        options[flag]=values
+    if '--execute' not in options:raise ValueError('预演任务请返回列表重新确认设置')
+    selected=targets(options.get('--serials',[]),options.get('--ble-ids'))
+    successful=set()
+    for item in outcomes:
+        if not isinstance(item,dict) or item.get('serial') not in selected or item.get('status') not in ('verified','failed','cancelled_unknown','not_attempted'):
+            raise ValueError('批量结果与原任务不一致，请核对日志后重新选择')
+        if item['status']=='verified':successful.add(item['serial'])
+    remaining={serial:address for serial,address in selected.items() if serial not in successful}
+    changes={};descriptions=[]
+    for flag,field,label,convert in (
+        ('--time','time','设备时间',str),('--interval','interval_seconds','采样间隔',int),
+        ('--wrap','wrap','滚动覆盖',lambda value:{'on':True,'off':False}[value]),
+        ('--update-seconds','update_seconds','实时更新间隔',int)):
+        if flag not in options:continue
+        value=options[flag][0]
+        try:changes[field]=convert(value)
+        except (ValueError,KeyError):raise ValueError('原设置值无效，请返回重新设置') from None
+        display='每台发送前的电脑本地时间' if field=='time' and value=='now' else format_interval(changes[field]) if field in ('interval_seconds','update_seconds') else value
+        descriptions.append(label+'：'+display)
+    validate_changes(changes)
+    if 'time' in changes and '--allow-schedule-shift' not in options:raise ValueError('原校时任务缺少风险确认，请返回重新设置')
+    if '--timeout' in options:
+        timeout=float(options['--timeout'][0])
+        if not math.isfinite(timeout) or timeout<=0:raise ValueError('原超时参数无效，请返回重新设置')
+    if not remaining:return None
+    args=['set-batch','--serials',*remaining]
+    if '--ble-ids' in options:args+=['--ble-ids',*[address or '-' for address in remaining.values()]]
+    for flag,value in options.items():
+        if flag not in multiple:args+=[flag,*([] if value is True else value)]
+    impact='先逐台核验身份并重新读取；已达目标的普通设置不再写入，仍回读核验并保存审计。读失败不写入，成功设备不加入本次重试。'
+    if 'time' in changes:
+        impact=('now逐台取当前电脑时间，校时可能改变采样相位，不能保证整点。' if changes['time']=='now' else '固定校时目标仍按原值，可能已过时并导致时间回退；务必核对目标日期时间。')+impact
+    return {'action':'set-batch','retry':True,'original_count':len(selected),'label':'仅重试未成功项',
+            'old':f'原任务{len(selected)}台，已成功{len(successful)}台',
+            'new':'；'.join(descriptions),'impact':impact,'arguments':args,'offset':0,
+            'targets':[{**devices.get(serial,{}),'serial':serial,'ble_id':address} for serial,address in remaining.items()]}

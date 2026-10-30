@@ -21,7 +21,7 @@ from .devices import model_type
 from .worker import Job
 from .ui_text import clip, wrap_lines, input_window
 from .ui_table import device_columns,result_columns,table_row,PREVIEW_COLUMNS
-from .ui_actions import format_interval, setting_change, retry_download_arguments, selected_devices, batch_setting_change
+from .ui_actions import format_interval, setting_change, retry_download_arguments, selected_devices, batch_setting_change, retry_batch_settings_plan
 
 PHASES = {'scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
           'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
@@ -205,6 +205,8 @@ class Terminal:
             job, action = self.job, self.action
             self.job = None
             self.action = None
+            if self.result_view is not None and self.result_view.pop('waiting_for_refresh',False):
+                self.result_view.pop('notice',None)
             self.message = ('已取消；已落盘数据保留，可再次下载' if job.cancelled else
                             '操作完成' if value == 0 else f'操作未完成（退出码 {value}），请查看下方日志')
             if job.cancelled and action in ('clear-history','erase-device'):
@@ -491,6 +493,7 @@ class Terminal:
                 'j 设置本次并发数；默认 1，建议先尝试 2，更多连接数需现场验证。',
                 '列表和结果：↑↓ / PgUp / PgDn / Home / End 导航，结果页 r 只重试未完成项。',
                 'g 设置：已勾选时进入批量设置，否则读取当前设备；预览后再 Enter 写入。',
+                '批量设置结果页r只选未成功项，预览后Enter先读再按需设置，成功设备不重复。',
                 '配置页 r 重新读取，w 读实时测量，f 闪灯定位，b 仍是数据库备份。',
                 '配置结果不确定时先 r 回读；校时只影响之后的记录，不改写历史。',
                 'c 取消任务；主界面 q 取消并退出；其他页面 Esc 返回上一层。',
@@ -521,6 +524,15 @@ class Terminal:
         elif key==curses.KEY_PPAGE: selected=max(0,selected-step)
         elif key==curses.KEY_HOME: selected=0
         elif key==curses.KEY_END: selected=max(0,len(outcomes)-1)
+        elif key=='r' and self.job:
+            view['notice']='正在刷新本地档案，请等待完成后重试'
+            view['waiting_for_refresh']=True
+        elif key=='r' and view['action']=='set-batch' and not self.job:
+            view.pop('notice',None)
+            try:
+                self.review=retry_batch_settings_plan(view['arguments'],outcomes,self.devices)
+                if self.review is None:view['notice']='所有目标均已成功，无需重试'
+            except ValueError as exc:view['notice']=str(exc)
         elif key=='r' and view['action'] not in ('set','set-batch','blink','clear-history','erase-device') and any(f.get('retryable') for f in view['failures']) and not self.job:
             args=retry_download_arguments(view['arguments'],outcomes,view['failures']) if view['action']=='download' else view['arguments']
             if args is None: self.message='所有可重试项均已保存；其余问题请核对后从列表选择'
@@ -551,9 +563,12 @@ class Terminal:
                 self.navigate_targets(self.review,key)
             elif key in ('\n','\r',curses.KEY_ENTER):
                 action=self.review.get('action','set')
+                retry_targets=self.review['targets'] if self.review.get('retry') else None
                 if self.start(action,self.review['arguments']) is not False:
                     self.review=None;self.form=None
-                    if action=='set-batch': self.batch_settings=None
+                    if action=='set-batch':
+                        if retry_targets is not None:self.marked={item['serial'] for item in retry_targets}
+                        self.batch_settings=None;self.result_view=None
                     elif action=='set' and self.data_view is not None:self.data_view['state']['read_stale']=True
                     elif action=='set' and self.device_state is not None: self.device_state['read_stale']=True
                 else: self.review['error']=self.message
@@ -1041,7 +1056,7 @@ class Terminal:
     def draw_review(self,height,width):
         self.screen.erase()
         review=self.review
-        self.put(0,'危险操作：核对清除范围' if review.get('action') in ('clear-history','erase-device') else '检查本地设备资料' if review.get('action')=='metadata' else '检查设备变更',curses.A_BOLD)
+        self.put(0,'危险操作：核对清除范围' if review.get('action') in ('clear-history','erase-device') else '核对未成功项重试' if review.get('retry') else '检查本地设备资料' if review.get('action')=='metadata' else '检查设备变更',curses.A_BOLD)
         if review.get('targets'):
             self.put(1,f"{len(review['targets'])} 台 · {review['label']}",curses.A_BOLD)
             for row,line in enumerate(wrap_lines('准备写入：'+review['new'],width-3)[:2],2):self.put(row,line)
@@ -1057,7 +1072,7 @@ class Terminal:
             wrapped=[line for text in lines for line in wrap_lines(text,width-3)]
             for row,line in enumerate(wrapped[:height-5],2):self.put(row,line)
         if review.get('error'):self.put(height-4,review['error'],curses.A_BOLD)
-        self.put(height-2,'Enter 执行已确认的单台清除 · Esc 取消' if review.get('action') in ('clear-history','erase-device') else 'Enter 保存本地资料 · Esc 返回修改' if review.get('action')=='metadata' else 'Enter 写入并回读验证 · Esc 返回修改',curses.A_BOLD)
+        self.put(height-2,'Enter 执行已确认的单台清除 · Esc 取消' if review.get('action') in ('clear-history','erase-device') else 'Enter 保存本地资料 · Esc 返回修改' if review.get('action')=='metadata' else 'Enter 先读取核验，再按需设置 · Esc 取消重试' if review.get('retry') else 'Enter 写入并回读验证 · Esc 返回修改',curses.A_BOLD)
         self.put(height-1,'先备份；保留管理编号和受试者代号；结果不明先核对，禁止直接重试。' if review.get('action') in ('clear-history','erase-device') else '仅当前领用信息，不改变历史观测归属。' if review.get('action')=='metadata' else self.message if self.job else '仅此步骤会发送配置；关闭预览不会改变设备',curses.A_DIM)
 
     def draw_result(self,height,width):
@@ -1065,8 +1080,13 @@ class Terminal:
         view=self.result_view;outcomes=view['outcomes']
         selected=min(view.get('selected',0),max(0,len(outcomes)-1))
         incomplete=sum(item.get('status') in ('pending','failed','cancelled_unknown','not_attempted') for item in outcomes)
+        batch_retry=None
+        if view['action']=='set-batch':
+            try:batch_retry=retry_batch_settings_plan(view['arguments'],outcomes,self.devices)
+            except ValueError:pass
+            if batch_retry is not None:incomplete=len(batch_retry['targets'])
         self.put(0,'下载结果' if view['action']=='download' else '操作结果',curses.A_BOLD)
-        self.put(1,f'本次处理 {len(outcomes)} 台 · 未完成 {incomplete} 台 · 退出码 {view["code"]}')
+        self.put(1,f'本次目标 {batch_retry["original_count"] if batch_retry else len(outcomes)} 台 · 未成功 {incomplete} 台 · 退出码 {view["code"]}' if view['action']=='set-batch' else f'本次处理 {len(outcomes)} 台 · 未完成 {incomplete} 台 · 退出码 {view["code"]}')
         self.put(2,f'第 {min(len(outcomes),selected+1)}/{len(outcomes)} 项 · ↑↓ / PgUp / PgDn / Home / End 显示全部结果',curses.A_DIM)
         count=max(1,height-13);top=max(0,selected-count+1)
         columns=result_columns(width-2,configuration=view['action']=='set-batch')
@@ -1081,7 +1101,7 @@ class Terminal:
         item=outcomes[selected] if outcomes else None
         failure=((item.get('error') or item.get('warning')) if item else None) or next((f for f in view['failures'] if item and f.get('serial')==item['serial']),None)
         if failure is None:failure=next((f for f in view['failures'] if not f.get('serial')),None)
-        lines=[]
+        lines=[view['notice']] if view.get('notice') else []
         if item and item.get('status')!='failed' and view['action']!='set-batch':
             lines.append(f'本次新增 {item.get("added_records",0):,} 条 · 累计 {item.get("total_records",0):,} 条 · 未确认 {item.get("pending_records",0):,} 条')
         if failure:
@@ -1090,6 +1110,8 @@ class Terminal:
             lines.extend(wrap_lines('建议：'+failure.get('action','按 l 查看日志'),width-3)[:2])
         elif item and view['action']=='set-batch':
             lines.append('配置已逐项回读验证并保存审计。' if item['status']=='verified' else STATUSES.get(item['status'],item['status']))
+            if item.get('settings_write_skipped') is True:lines.append('普通设置已符合目标，未重复写入；回读核验通过。')
+            if item.get('time_write_skipped') is True:lines.append('时差在1秒阈值内，本次未重复校时。')
             if item.get('time_write_target_local'):lines.append('实际校时目标：'+item['time_write_target_local'])
             if item.get('sampling_risk'):lines.append('时钟回读通过不代表整点采样；返回按 t 诊断后续记录。')
             if item['status']!='verified':lines.append('先读取本台设置核对，再决定是否重新配置。')
@@ -1103,8 +1125,9 @@ class Terminal:
             lines.append('记录已正式保存，可查看、导出或备份。')
             if item.get('last_timestamp'):lines.append('末条设备记录时间：'+item['last_timestamp'])
         for row,line in enumerate(lines[:5],height-8):self.put(row,line)
-        retry=any(f.get('retryable') for f in view['failures'])
-        self.put(height-2,('r 仅重试未完成项 · ' if retry else '')+'l 日志 · Esc / Enter 返回')
+        if view['action']=='set-batch':retry=batch_retry is not None
+        else:retry=view['action'] not in ('set','blink','clear-history','erase-device') and any(f.get('retryable') for f in view['failures'])
+        self.put(height-2,('r 仅重试未成功项 · ' if retry and not self.job and view['action']=='set-batch' else 'r 仅重试未完成项 · ' if retry and not self.job else '')+'l 日志 · Esc / Enter 返回')
         self.put(height-1,'g 读取当前设备核对 · l 日志 · b 数据库备份' if view['action']=='set-batch' else 'v 查看当前设备记录 · e 导出 · b 数据库备份',curses.A_DIM)
 
     def loop(self):

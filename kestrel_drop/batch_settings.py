@@ -61,7 +61,9 @@ async def configure(library, selected, changes, *, execute=False, timeout=20, al
                              'action_id': value['action_id'], 'timings_seconds': value.get('timings_seconds', {}),
                              'time_write_target_local': value['after'].get('time_write_target_local'),
                              'sampling_risk':value['after'].get('sampling_risk'),
-                             'time_write_skipped':value['after'].get('time_write_skipped')})
+                             'time_write_skipped':value['after'].get('time_write_skipped'),
+                             'settings_write_skipped':value['after'].get('settings_write_skipped'),
+                             'settings_written_fields':value['after'].get('settings_written_fields')})
                 else:
                     publish({'serial': serial, 'status': 'dry_run', 'changes': changes,'sampling_risk':control.clock_risk(changes)})
             except (asyncio.CancelledError, KeyboardInterrupt):

@@ -110,9 +110,9 @@ uv run kestrel.py set-batch --serials 2509793 2525425 --interval 600 --wrap on -
 
 必须显式提供 --serials；不支持 --all，以免把历史离线登记自动纳入配置。可选 --ble-ids 与编号逐项对应，- 表示按编号寻找，--timeout 默认 20 秒。支持 --interval、--wrap、--update-seconds 和 --time，范围与单台一致；不批量改名称和参考海拔。
 
-逐台核验、读取本台旧值、写入、回读并保存独立审计。整批共用目录写锁，单台设备错误继续其他设备，存储等批次级错误会终止。下载并发数不适用于批量设置。配置不是跨设备原子事务，不会自动回滚或重试。
+逐台核验、读取本台旧值、写入、回读并保存独立审计。整批共用目录写锁，单台设备错误继续其他设备，存储等批次级错误会终止。下载并发数不适用于批量设置。配置不是跨设备原子事务，不会自动回滚或自行循环重试。TUI结果页r提供手动“仅重试未成功项”：保留原参数与地址对应，排除verified，失败/取消/未开始及缺少报告的原目标重新预览确认后执行；后台沿用逐台读取、同值普通参数跳过写入、回读和审计流程。CLI再次执行时应显式缩小--serials，勿将已成功设备一并重放。
 
-JSON 结果 configurations 逐项列出 verified / failed / dry_run / cancelled_unknown / not_attempted，并返回独立 action_id，校时还返回 time_write_target_local。全部完成退出 0，单台失败退出 2，取消退出 130；取消时尽可能报告已完成、当前结果未知及未执行项。JSON Lines 新增 configured 事件，协议版本仍为 1。失败或取消后先用 device 回读、actions 看审计，再决定是否重新设置。
+JSON 结果 configurations 逐项列出 verified / failed / dry_run / cancelled_unknown / not_attempted，并返回独立 action_id，校时还返回 time_write_target_local、time_write_skipped；普通设置还返回settings_write_skipped及settings_written_fields，明确哪些字段实际写过。全部完成退出 0，单台失败退出 2，取消退出 130；取消时尽可能报告已完成、当前结果未知及未执行项。JSON Lines 新增 configured 事件，协议版本仍为 1。失败或取消后先用 device 回读、actions 看审计，再决定是否重新设置。
 
 ## 数据位置、备份、恢复和旧版导入
 
