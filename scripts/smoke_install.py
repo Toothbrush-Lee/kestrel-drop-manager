@@ -47,7 +47,7 @@ def smoke(prefix):
         try:
             wait_for('已读取 0 个设备')
             os.write(master,b'?');wait_for('帮助 / 任务日志')
-            os.write(master,b'\x1b');wait_for('KESTREL DROP')
+            os.write(master,b'\x1b');wait_for('Kestrel DROP')
             os.write(master,b'q')
             deadline = time.monotonic() + 15
             while process.poll() is None and time.monotonic() < deadline:

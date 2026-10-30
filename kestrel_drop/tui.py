@@ -19,7 +19,8 @@ from .protocol import TransferProgress
 from .errors import TITLES
 from .devices import model_type
 from .worker import Job
-from .ui_text import clip, text_width, wrap_lines, input_window
+from .ui_text import clip, wrap_lines, input_window
+from .ui_table import device_columns,result_columns,table_row,PREVIEW_COLUMNS
 from .ui_actions import format_interval, setting_change, retry_download_arguments, selected_devices, batch_setting_change
 
 PHASES = {'scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
@@ -900,20 +901,19 @@ class Terminal:
         self.screen.refresh()
 
     def draw_dashboard(self,height,width):
-        self.put(0,f'KESTREL DROP  /  电脑下载管理  {__version__}',curses.A_BOLD)
+        self.put(0,f'Kestrel DROP · {__version__}',curses.A_BOLD)
         self.put(1,f'数据目录：{self.library.root}',curses.A_DIM)
         nearby=sum(bool(item.get('nearby')) for item in self.devices.values())
-        scope=f'勾选的 {len(self.marked)} 台' if self.marked else '尚未勾选（A 全选）'
-        self.put(2,f'近10分钟 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.parallel} · Enter / a 下载：{scope}')
+        self.put(2,f'近10分钟 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.parallel}')
         values=list(self.devices.values())
         if values:
             item=values[min(self.selected,len(values)-1)]
             self.put(3,f'当前 {self.selected+1}/{len(values)}：{item.get("management_code") or "未编号"} · {item.get("serial") or "序列号待核验"} · 受试者 {item.get("participant_code") or "未分配"} · z 编辑资料',curses.A_DIM)
-        self.put(4,'选 型号  管理编号/序列号          附近    已入库    未确认   状态 / 末条记录时间',curses.A_BOLD)
+        columns=device_columns(width-2)
+        self.put(4,table_row(columns),curses.A_BOLD)
         visible=max(2,min(8,height-15))
         top=max(0,self.selected-visible+1)
         for index,item in enumerate(values[top:top+visible],top):
-            serial=item.get('serial') or '待核验（x）'
             kind=item.get('device_type') or model_type(item.get('model')) or '未知'
             state=(item.get('error') or ('身份冲突，请核验' if item.get('identity_conflict') else None)
                    or item.get('identity_error') or item.get('last_timestamp') or
@@ -926,12 +926,13 @@ class Terminal:
                 elif progress.get('event') in ('completed','configured'): state=STATUSES.get(progress.get('status'),state)
                 elif progress.get('event')=='error': state='未完成：'+progress.get('message','查看日志')
             location=('本次' if item.get('seen_this_scan') else '近期') if item.get('nearby') else '—'
-            location+= ' '*max(0,4-text_width(location))
             pending=item.get('pending_records')
-            display_serial=clip((item.get('management_code')+'/' if item.get('management_code') else '')+serial,18)
-            line=(f'{"*" if item.get("serial") in self.marked else " "}  {kind:<4} {display_serial:<18} {location} '
-                  f'{item.get("database_records",item.get("committed_records","—")):>7}  '
-                  f'{pending if pending is not None else "—":>7}  {state}')
+            line=table_row(columns,{
+                'mark':'*' if item.get('serial') in self.marked else '',
+                'kind':kind,'code':item.get('management_code') or '—',
+                'serial':item.get('serial') or '待核验','participant':item.get('participant_code') or '未分配',
+                'location':location,'records':item.get('database_records',item.get('committed_records','—')),
+                'pending':pending if pending is not None else '—','status':state})
             self.put(5+index-top,line,curses.A_REVERSE if index==self.selected else 0)
         if not values:
             self.put(6,'第一次使用：按 s 扫描附近设备',curses.A_BOLD)
@@ -953,12 +954,12 @@ class Terminal:
         self.screen.erase()
         self.put(0,'最近 100 条 · 按设备序号排列，最新在上 · Esc 返回',curses.A_BOLD)
         self.put(1,f'显示 {min(len(self.preview),self.preview_offset+1)}/{len(self.preview)} · ↑↓ / PgUp / PgDn / Home / End',curses.A_DIM)
-        self.put(2,'设备记录时间            温度°C     湿度%     气压hPa')
+        self.put(2,table_row(PREVIEW_COLUMNS),curses.A_BOLD)
         for row,item in enumerate(self.preview[self.preview_offset:self.preview_offset+height-5],3):
             humidity=item['relative_humidity_pct'];pressure=item['station_pressure_hpa']
-            self.put(row,f'{item["timestamp_device_local"]}   {item["temperature_c"]:>8}  '
-                     f'{str(humidity) if humidity is not None else "--":>8}  '
-                     f'{str(pressure) if pressure is not None else "--":>10}')
+            self.put(row,table_row(PREVIEW_COLUMNS,{'time':item['timestamp_device_local'],
+                'temperature':item['temperature_c'],'humidity':humidity if humidity is not None else '--',
+                'pressure':pressure if pressure is not None else '--'}))
         if not self.preview:self.put(4,'没有可显示的正式记录')
         self.put(height-1,'-- 表示该型号没有此测量；时间为设备原始本地时间',curses.A_DIM)
 
@@ -1068,11 +1069,14 @@ class Terminal:
         self.put(1,f'本次处理 {len(outcomes)} 台 · 未完成 {incomplete} 台 · 退出码 {view["code"]}')
         self.put(2,f'第 {min(len(outcomes),selected+1)}/{len(outcomes)} 项 · ↑↓ / PgUp / PgDn / Home / End 显示全部结果',curses.A_DIM)
         count=max(1,height-13);top=max(0,selected-count+1)
-        self.put(3,'设备编号          配置状态（逐台回读）' if view['action']=='set-batch' else '设备编号          状态              新增     累计   未确认',curses.A_BOLD)
+        columns=result_columns(width-2,configuration=view['action']=='set-batch')
+        self.put(3,table_row(columns),curses.A_BOLD)
         for index,item in enumerate(outcomes[top:top+count],top):
             label=STATUSES.get(item.get('status'),item.get('status','未完成'))
-            label=clip(label,16)+' '*max(0,16-text_width(clip(label,16)))
-            line=f'{item["serial"]:<16} {label}' if view['action']=='set-batch' else f'{item["serial"]:<16} {label} {item.get("added_records",0):>6} {item.get("total_records",0):>8} {item.get("pending_records",0):>6}'
+            device=self.devices.get(item['serial'],{})
+            line=table_row(columns,{'code':device.get('management_code') or '—','serial':item['serial'],
+                'participant':device.get('participant_code') or '未分配','status':label,
+                'added':item.get('added_records',0),'total':item.get('total_records',0),'pending':item.get('pending_records',0)})
             self.put(4+index-top,line,curses.A_REVERSE if index==selected else 0)
         item=outcomes[selected] if outcomes else None
         failure=((item.get('error') or item.get('warning')) if item else None) or next((f for f in view['failures'] if item and f.get('serial')==item['serial']),None)
