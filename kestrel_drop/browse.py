@@ -40,6 +40,21 @@ def filters(serial,start,end):
     return ' WHERE h.serial=? AND o.timestamp_device_local>=? AND o.timestamp_device_local<=?',(serial,start,end)
 
 
+def device_selection(serials):
+    if isinstance(serials,str):serials=[serials]
+    if not isinstance(serials,(list,tuple)) or not 1<=len(serials)<=100:
+        raise ValueError('请选择1–100台设备')
+    selected=tuple(serial_number(value) for value in serials)
+    if len(set(selected))!=len(selected):raise ValueError('设备选择不能重复')
+    return selected
+
+
+def selection_filters(serials,start,end):
+    selected=device_selection(serials)
+    _,(_,start,end)=filters(selected[0],start,end)
+    return ' WHERE h.serial IN ('+','.join('?' for _ in selected)+') AND o.timestamp_device_local>=? AND o.timestamp_device_local<=?',(*selected,start,end)
+
+
 class Browser:
     def __init__(self,root):
         self.root=Path(root).expanduser().resolve()
@@ -61,30 +76,42 @@ class Browser:
                 LEFT JOIN observations o ON o.history_id=h.id GROUP BY d.serial ORDER BY d.serial''')]
 
     def read(self,serial,start,end,*,page=1,page_size=200,chart_limit=2000):
+        return self.read_many([serial],start,end,page=page,page_size=page_size,chart_limit=chart_limit)
+
+    def read_many(self,serials,start,end,*,page=1,page_size=200,chart_limit=2000):
         if type(page) is not int or not 1<=page<=10000000:raise ValueError('页码无效')
         if type(page_size) is not int or not 1<=page_size<=500:raise ValueError('每页须为1–500条')
         if type(chart_limit) is not int or not 10<=chart_limit<=5000:raise ValueError('图表上限须为10–5000点')
-        where,args=filters(serial,start,end)
+        selected=device_selection(serials)
+        where,args=selection_filters(selected,start,end)
         with self.snapshot() as c:
-            self.store._history(c,serial_number(serial))
+            for serial in selected:self.store._history(c,serial)
             summary=dict(c.execute('SELECT count(*) AS records,min(o.timestamp_device_local) AS first_time,max(o.timestamp_device_local) AS last_time'+FROM+where,args).fetchone())
             pages=max(1,math.ceil(summary['records']/page_size));page=min(page,pages)
-            rows=[dict(r) for r in c.execute('SELECT '+SELECT+FROM+where+' ORDER BY '+ORDER+' LIMIT ? OFFSET ?',(*args,page_size,(page-1)*page_size))]
-            stride=max(1,math.ceil(summary['records']/chart_limit))
-            # The row-number sample retains distinct sequence IDs, including equal timestamps.
-            sql='WITH numbered AS (SELECT '+SELECT+',row_number() OVER (ORDER BY '+ORDER+') AS n'+FROM+where+') SELECT '+','.join(COLUMNS)+' FROM numbered WHERE (n-1)%?=0 OR n=? ORDER BY n'
-            points=[dict(r) for r in c.execute(sql,(*args,stride,summary['records']))]
-            return {**summary,'rows':rows,'points':points,'page':page,'pages':pages,'stride':stride}
+            rows=[dict(r) for r in c.execute('SELECT '+SELECT+FROM+where+' ORDER BY h.serial,'+ORDER+' LIMIT ? OFFSET ?',(*args,page_size,(page-1)*page_size))]
+            totals={r['serial']:dict(r) for r in c.execute('SELECT h.serial,count(*) AS records,min(o.timestamp_device_local) AS first_time,max(o.timestamp_device_local) AS last_time'+FROM+where+' GROUP BY h.serial',args)}
+            # A shared point budget is divided between devices; a dense device cannot hide a sparse one.
+            quota=max(2,chart_limit//len(selected))
+            numbered='WITH numbered AS (SELECT '+SELECT+',row_number() OVER (PARTITION BY h.serial ORDER BY '+ORDER+') AS n,count(*) OVER (PARTITION BY h.serial) AS total'+FROM+where+') '
+            points=[dict(r) for r in c.execute(numbered+'SELECT '+','.join(COLUMNS)+' FROM numbered WHERE (n-1)%max(1,(total+?-1)/?)=0 OR n=total ORDER BY serial,n',(*args,quota,quota))]
+            latest={r['serial']:dict(r) for r in c.execute(numbered+'SELECT '+','.join(COLUMNS)+' FROM numbered WHERE n=total ORDER BY serial',args)}
+            devices=[{**totals.get(serial,{'serial':serial,'records':0,'first_time':None,'last_time':None}),
+                      'latest':latest.get(serial),'stride':max(1,math.ceil(totals.get(serial,{}).get('records',0)/quota))} for serial in selected]
+            return {**summary,'rows':rows,'points':points,'page':page,'pages':pages,'stride':max(d['stride'] for d in devices),'devices':devices}
 
     def csv(self,serial,start,end,*,max_records=100000,max_bytes=32*1024*1024):
-        where,args=filters(serial,start,end)
+        return self.csv_many([serial],start,end,max_records=max_records,max_bytes=max_bytes)
+
+    def csv_many(self,serials,start,end,*,max_records=100000,max_bytes=32*1024*1024):
+        selected=device_selection(serials)
+        where,args=selection_filters(selected,start,end)
         with self.snapshot() as c:
-            self.store._history(c,serial_number(serial))
+            for serial in selected:self.store._history(c,serial)
             count=c.execute('SELECT count(*)'+FROM+where,args).fetchone()[0]
             if count>max_records:raise ValueError('浏览器单次导出上限10万条；请缩小范围，或使用CLI export导出完整历史')
             stream=io.StringIO(newline='');writer=csv.DictWriter(stream,fieldnames=COLUMNS)
             writer.writeheader()
-            cursor=c.execute('SELECT '+SELECT+FROM+where+' ORDER BY '+ORDER,args)
+            cursor=c.execute('SELECT '+SELECT+FROM+where+' ORDER BY h.serial,'+ORDER,args)
             while batch:=cursor.fetchmany(1000):
                 writer.writerows(dict(row) for row in batch)
                 if stream.tell()>max_bytes:raise ValueError('导出内容超过浏览器容量；请缩小时间范围')

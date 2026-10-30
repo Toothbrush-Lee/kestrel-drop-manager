@@ -67,6 +67,40 @@ class BrowserTests(unittest.TestCase):
             self.assertEqual(reader.execute('SELECT count(*) FROM devices').fetchone()[0],1)
             with self.assertRaises(sqlite3.OperationalError):reader.execute('DELETE FROM devices')
         self.assertEqual(len(self.browser.catalog()),2)
+
+    def test_multi_device_values_pages_export_and_empty_device_share_one_scope(self):
+        self.library.store.import_rows('3','D3',rows((20,25)),202,{})
+        self.library.store.register_device('2','D1')
+        before=self.library.database_path.read_bytes()
+        result=self.browser.read_many(['2866855','3','2'],self.start,self.end,page_size=2)
+        self.assertEqual((result['records'],result['pages']),(5,3))
+        summary={d['serial']:d for d in result['devices']}
+        self.assertEqual(summary['2']['records'],0);self.assertIsNone(summary['2']['latest'])
+        self.assertEqual(summary['3']['latest']['device_sequence'],202)
+        self.assertEqual(summary['2866855']['latest']['device_sequence'],103)
+        pages=[self.browser.read_many(['2866855','3','2'],self.start,self.end,page=p,page_size=2)['rows'] for p in (1,2,3)]
+        self.assertEqual([(r['serial'],r['device_sequence']) for page in pages for r in page],[('2866855',101),('2866855',102),('2866855',103),('3',201),('3',202)])
+        body,count=self.browser.csv_many(['2866855','3','2'],self.start,self.end)
+        exported=list(csv.DictReader(io.StringIO(body.decode('utf-8-sig'))))
+        self.assertEqual(count,5);self.assertEqual({r['serial'] for r in exported},{'2866855','3'})
+        with self.assertRaises(ValueError):self.browser.csv_many(['2866855','3'],self.start,self.end,max_records=4)
+        self.assertEqual(self.library.database_path.read_bytes(),before)
+
+    def test_multi_chart_budget_does_not_hide_sparse_device_and_latest_uses_sequence(self):
+        self.library.store.import_rows('3','D3',rows((25,20))*100,200,{})
+        result=self.browser.read_many(['3','2866855'],self.start,self.end,chart_limit=10)
+        self.assertLessEqual(len(result['points']),12)
+        for serial,first,last in [('3',1,200),('2866855',101,103)]:
+            points=[p for p in result['points'] if p['serial']==serial]
+            self.assertEqual((points[0]['device_sequence'],points[-1]['device_sequence']),(first,last))
+        dense=next(d for d in result['devices'] if d['serial']=='3')
+        self.assertEqual(dense['latest']['timestamp_device_local'],self.start)
+        self.assertEqual(dense['last_time'],self.end)
+
+    def test_multi_scope_rejects_empty_duplicate_missing_or_injected_targets(self):
+        for values in ([],['2866855','2866855'],['2866855','1 OR 1=1'],['1']*101,None):
+            with self.subTest(values=values),self.assertRaises(ValueError):self.browser.read_many(values,self.start,self.end)
+        with self.assertRaises(FileNotFoundError):self.browser.read_many(['2866855','999'],self.start,self.end)
     def test_missing_path_is_never_created(self):
         path=self.root/'wrong'
         with self.assertRaises(FileNotFoundError):Browser(path)
@@ -96,7 +130,7 @@ class ViewerAppTests(unittest.TestCase):
     def test_first_render_and_export_are_read_only(self):
         self.assertFalse(self.app.exception)
         before=self.library.database_path.read_bytes()
-        self.app.selectbox(key='device').select('2866855').run()
+        self.app.multiselect(key='devices').set_value(['2866855']).run()
         self.assertFalse(self.app.exception)
         self.assertEqual(self.app.metric[0].value,'3')
         button=next(b for b in self.app.button if b.label=='准备导出筛选结果')
@@ -104,15 +138,15 @@ class ViewerAppTests(unittest.TestCase):
         self.assertEqual(self.library.database_path.read_bytes(),before)
         self.assertEqual(self.app.session_state['csv'][2],3)
     def test_empty_device_and_empty_time_range(self):
-        self.app.selectbox(key='device').select('2').run()
+        self.app.multiselect(key='devices').set_value(['2']).run()
         self.assertFalse(self.app.exception);self.assertIn('尚无正式观测',self.app.info[0].value)
-        self.app.selectbox(key='device').select('2866855').run()
+        self.app.multiselect(key='devices').set_value(['2866855']).run()
         self.app.datetime_input(key='start_2866855').set_value(datetime(2026,10,23))
         self.app.datetime_input(key='end_2866855').set_value(datetime(2026,10,24))
         next(b for b in self.app.button if b.label=='应用筛选').click().run()
         self.assertFalse(self.app.exception);self.assertEqual(self.app.metric[0].value,'0')
     def test_invalid_range_shows_error_without_crashing(self):
-        self.app.selectbox(key='device').select('2866855').run()
+        self.app.multiselect(key='devices').set_value(['2866855']).run()
         self.app.datetime_input(key='start_2866855').set_value(datetime(2026,10,24))
         next(b for b in self.app.button if b.label=='应用筛选').click().run()
         self.assertFalse(self.app.exception);self.assertTrue(self.app.error)
@@ -121,7 +155,7 @@ class ViewerAppTests(unittest.TestCase):
         raw=bytearray(record(25));raw[0]=47
         decoded=protocol.decode_record(bytes(raw),block=0,position=3)
         self.library.store.import_rows('3','D3',rows((20,25,25))+[decoded],104,{})
-        self.app.run().selectbox(key='device').select('3').run()
+        self.app.run().multiselect(key='devices').set_value(['3']).run()
         self.app.datetime_input(key='start_3').set_value(datetime(2026,10,22,14,25))
         self.app.datetime_input(key='end_3').set_value(datetime(2026,10,22,14,25))
         next(b for b in self.app.button if b.label=='应用筛选').click().run()
@@ -129,3 +163,30 @@ class ViewerAppTests(unittest.TestCase):
         self.assertEqual(self.app.session_state['selection'][2],datetime(2026,10,22,14,25,59))
         self.app.datetime_input(key='start_3').set_value(datetime(2026,10,24)).run()
         self.assertFalse(self.app.exception);self.assertEqual(self.app.metric[0].value,'3')
+
+    def test_multi_selection_latest_values_chart_export_and_scope_change(self):
+        self.library.store.import_rows('3','D3',rows((20,25)),202,{})
+        self.library.metadata('3',management_code='D3-003',participant_code='P007')
+        self.app.run().multiselect(key='devices').set_value(['2866855','3','2']).run()
+        self.assertFalse(self.app.exception)
+        self.assertEqual(self.app.metric[0].value,'5')
+        self.assertEqual(self.app.metric[1].value,'2 / 3')
+        latest=self.app.dataframe[0].value
+        self.assertEqual(len(latest),3)
+        self.assertEqual(latest.loc[latest.serial=='3','participant_code'].iloc[0],'P007')
+        self.assertEqual(latest.loc[latest.serial=='3','device_sequence'].iloc[0],'202')
+        self.assertEqual(latest.loc[latest.serial=='2','records'].iloc[0],0)
+        next(b for b in self.app.button if b.label=='准备导出筛选结果').click().run()
+        self.assertEqual(self.app.session_state['csv'][2],5)
+        self.app.multiselect(key='devices').set_value(['2866855']).run()
+        self.assertFalse(self.app.exception);self.assertEqual(self.app.metric[0].value,'3')
+        self.assertNotIn('csv',self.app.session_state)
+
+    def test_clear_and_select_all_and_refresh_invalidates_prepared_export(self):
+        next(b for b in self.app.button if b.label=='准备导出筛选结果').click().run()
+        next(b for b in self.app.button if b.label=='刷新数据').click().run()
+        self.assertNotIn('csv',self.app.session_state)
+        next(b for b in self.app.button if b.label=='清空选择').click().run()
+        self.assertFalse(self.app.exception);self.assertIn('请先选择',self.app.info[0].value)
+        next(b for b in self.app.button if b.label=='全选设备').click().run()
+        self.assertFalse(self.app.exception);self.assertEqual(self.app.metric[1].value,'1 / 2')
