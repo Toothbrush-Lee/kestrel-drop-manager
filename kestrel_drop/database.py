@@ -466,6 +466,13 @@ class Store:
                                (transfer_id, sequence, payload, hashlib.sha256(payload).hexdigest()))
         # Returning from this transaction is the only ACK-eligible boundary.
 
+    def interrupt_transfer(self, transfer_id, error):
+        """Retain blocks and the original failure for later diagnosis and safe resume."""
+        with self.transaction() as connection:
+            evidence={'error_type':type(error).__name__,'error':str(error),'pending_preserved':True}
+            connection.execute("UPDATE transfers SET status='interrupted',finished_utc=?,validation_json=? WHERE id=? AND status='receiving'",
+                               (utcnow(),json.dumps(evidence,ensure_ascii=False),transfer_id))
+
     def finish_transfer(self, transfer_id, *, next_cursor, elapsed_seconds, maxrows, received_rows):
         with self.transaction() as connection:
             transfer = connection.execute('SELECT * FROM transfers WHERE id=?', (transfer_id,)).fetchone()

@@ -256,7 +256,9 @@ class Library:
             except CompletionAckFailure:
                 progress.finish(success=True)
                 raise
-            except BaseException:
+            except BaseException as exc:
+                try:store.interrupt_transfer(transfer_id,exc)
+                except Exception as diagnostic_error:exc.add_note(f"Failed to save transfer diagnostic: {diagnostic_error}")
                 progress.finish(success=False, partial_saved=True)
                 raise
             return 0

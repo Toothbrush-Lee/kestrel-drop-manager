@@ -177,6 +177,30 @@ class OfficialWireTests(unittest.IsolatedAsyncioTestCase):
         _,_,final=await session.download_from_cursor(cursor,1,20000)
         self.assertEqual(final,cursor+1)
 
+    async def test_identical_last_block_retransmit_is_acknowledged_without_second_commit(self):
+        from unittest.mock import Mock
+        class Client:
+            async def write_gatt_char(self,*args,**kwargs):pass
+        session=protocol.BleSession(Client(),model='D1')
+        payload=b'\0\0'+RAW[:9]
+        for f in (protocol.Frame(1,profile('D1').schema,b''),protocol.Frame(3,payload,b''),protocol.Frame(3,payload,b''),protocol.Frame(0,b'\x12\0'+(101).to_bytes(8,'little'),b'')):
+            session.queue.put_nowait(f)
+        committed=Mock()
+        records,blocks,final=await session.download_from_cursor(100,1,20000,on_block=committed)
+        self.assertEqual((len(records),len(blocks),final),(1,1,101));committed.assert_called_once()
+
+    async def test_conflicting_duplicate_and_endless_retransmits_still_fail(self):
+        class Client:
+            async def write_gatt_char(self,*args,**kwargs):pass
+        for conflicting in (True,False):
+            session=protocol.BleSession(Client(),model='D1')
+            payload=b'\0\0'+RAW[:9]
+            session.queue.put_nowait(protocol.Frame(1,profile('D1').schema,b''))
+            session.queue.put_nowait(protocol.Frame(3,payload,b''))
+            changed=payload[:-1]+bytes([payload[-1]^1])
+            for _ in range(4):session.queue.put_nowait(protocol.Frame(3,changed if conflicting else payload,b''))
+            with self.assertRaises(protocol.TransferError):await session.download_from_cursor(100,1,20000)
+
     async def test_nack_has_explicit_command_and_reason(self):
         session=protocol.BleSession(None,model='D1')
         session.queue.put_nowait(protocol.Frame(5,b'\x1a\0\x0b\0',b''))

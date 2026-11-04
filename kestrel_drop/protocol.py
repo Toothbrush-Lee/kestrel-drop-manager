@@ -539,6 +539,7 @@ class BleSession:
         rows=[];blocks=[];next_cursor=None
         seen=set()
         schema_seen=False
+        last_payload=None;repeats=0
         while True:
             frame=await self.next(timeout=45)
             if frame.kind==4:
@@ -560,7 +561,14 @@ class BleSession:
                 except (ValueError, RuntimeError) as exc:
                     raise TransferError(f'Invalid record block: {exc}') from exc
                 seq=meta[0]['block']
-                if seq in seen:raise TransferError(f'Duplicate block {seq}')
+                if seq in seen:
+                    if not self.require_schema:raise TransferError(f'Duplicate block {seq}')
+                    if seq!=len(blocks)-1 or frame.payload!=last_payload:
+                        raise TransferError(f'Conflicting or stale duplicate block {seq}; nothing duplicated')
+                    repeats+=1
+                    if repeats>3:raise TransferError(f'Repeated block {seq} exceeded retry limit')
+                    await self.ack(0xffff if self.require_schema else 5)
+                    continue
                 # Observed D3 transfers start at zero, including absolute-cursor resumes.
                 if seq != len(blocks):
                     raise TransferError(f'Missing or out-of-order log blocks: expected {len(blocks)}, got {seq}')
@@ -569,6 +577,7 @@ class BleSession:
                 if len(rows)+len(new)>maxrows:raise RuntimeError('Exceeded configured record limit')
                 if on_block is not None:
                     on_block(new, meta)  # durably persist this CRC-checked block BEFORE ACK
+                last_payload=frame.payload;repeats=0
                 seen.add(seq);rows.extend(new);blocks.extend(meta)
                 if progress is not None:
                     progress.update(len(rows))
