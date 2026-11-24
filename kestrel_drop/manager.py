@@ -450,6 +450,12 @@ def parser():
     backup.add_argument('output', nargs='?', type=Path, help='默认保存在数据目录/backups/')
     status = sub.add_parser('status', help='查看指定设备或所有档案状态')
     status.add_argument('serial', nargs='?', type=serial_number)
+    follow=sub.add_parser('followup',help='随访：持续扫描已登记设备并自动并发下载，本场成功后跳过')
+    follow.add_argument('--parallel',type=int,default=6)
+    follow.add_argument('--scan-seconds',type=float,default=8)
+    follow.add_argument('--max-attempts',type=int,default=3)
+    follow.add_argument('--rounds',type=int,default=None,help='限制扫描轮数；默认持续运行至Ctrl+C')
+    follow.add_argument('--execute',action='store_true')
     download = sub.add_parser('download', help='首次完整下载或自动增量同步')
     target = download.add_mutually_exclusive_group(required=True)
     target.add_argument('--serial', type=serial_number)
@@ -632,6 +638,11 @@ def _run(args):
                                                  execute=args.execute, timeout=args.timeout,allow_schedule_shift=args.allow_schedule_shift))
             events.result(result)
             return 2 if result['incomplete'] else 0
+        elif args.command=='followup':
+            from .followup import run
+            result=asyncio.run(run(library,parallel=args.parallel,scan_seconds=args.scan_seconds,max_attempts=args.max_attempts,rounds=args.rounds,execute=args.execute))
+            events.result(result)
+            return 2 if result.get('incomplete') else 0
         elif args.command == 'download':
             if not 1 <= args.parallel <= 8: raise ValueError('并发连接数必须为 1–8')
             if args.ble_ids and (not args.serials or len(args.ble_ids) != len(args.serials)):

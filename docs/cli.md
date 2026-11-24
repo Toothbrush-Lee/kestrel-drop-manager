@@ -183,3 +183,7 @@ data-info和偏好设置不连接蓝牙；自动同步默认关闭。device-coun
 两种清除默认预演，不清数据。实际执行必须同时传 `--execute --confirm-serial 完整序列号 --expected-revision 刚读取的data-info.revision`；不支持all/serials。revision防止确认后数据或领用信息变化。clear-history会先生成独立备份再清除本机该设备全部正式记录、暂存和传输历史；erase-device先同步、备份再使用官方命令1清设备日志，并用命令2核对0条，电脑历史与游标保留。备份失败或数据有未确认项时不清除；结果不明不得直接重试。建议普通用户使用h页的输入确认流程。erase-device和device-count支持--ble-id、--timeout。
 
 清除范围、自动同步的短连接行为和采集中清设备的边界详见[数据管理指南](data-management.md)。
+
+### 持续随访采集
+
+`uv run kestrel.py followup --execute`：默认6路并发、8秒扫描窗口，持续发现到场的已登记设备并自动下载；Ctrl+C停止并保留暂存。可加`--parallel 1–8`、`--scan-seconds 5–60`、`--max-attempts 1–5`，不加`--execute`仅预演。每场成功设备只处理一次；重进是新场。`--rounds N`限制扫描轮数并等待当前活动下载结束，未处理/失败项仍返回非零状态。场次JSON保存在数据目录followups/。未登记设备不自动下载；完整交互见用户手册的随访模式。

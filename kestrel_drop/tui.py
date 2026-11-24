@@ -23,7 +23,7 @@ from .ui_text import clip, wrap_lines, input_window
 from .ui_table import device_columns,result_columns,table_row,PREVIEW_COLUMNS
 from .ui_actions import format_interval, setting_change, retry_download_arguments, selected_devices, batch_setting_change, retry_batch_settings_plan
 
-PHASES = {'scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
+PHASES = {'followup_scanning':'随访：持续扫描到场设备','scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
           'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
           'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库', 'auto_sync':'连接后自动同步历史', 'backing_up':'正在完整备份电脑档案', 'clearing_local':'正在清除本机历史（设备不改）', 'erasing_device':'正在清除设备日志（电脑历史保留）', 'checking_device_count':'正在回读设备日志条数', 'reading_settings':'正在读取设备设置'}
 STATUSES = {'downloaded': '已保存', 'saved_warning': '已保存，有提醒', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
@@ -132,6 +132,7 @@ class Terminal:
         self.review = None
         self.batch_settings = None
         self.device_progress = {}
+        self.followup = None
         self.parallel = 1
         self.last_stamp = None
         self.list_stamp = None
@@ -172,12 +173,14 @@ class Terminal:
             self.message = '任务执行中；按 c 取消，或等待完成'
             return False
         if action=='list': self.list_stamp=self.database_stamp()
-        if action in ('download','set-batch'): self.device_progress={}
+        if action in ('download','set-batch','followup'): self.device_progress={}
+        if action=='followup':self.followup={'parallel':int(arguments[arguments.index('--parallel')+1]) if '--parallel' in arguments else 6}
         self.action = action
         self.progress = ''
         try:
             self.job = Job(self.library.root, arguments)
         except OSError as exc:
+            if action=='followup':self.followup=None
             self.action=None
             self.message=f'无法启动后台任务：{exc}'
             self.logs.append(self.message)
@@ -205,6 +208,7 @@ class Terminal:
             job, action = self.job, self.action
             self.job = None
             self.action = None
+            if action=='followup':self.followup=None
             if self.result_view is not None and self.result_view.pop('waiting_for_refresh',False):
                 self.result_view.pop('notice',None)
             self.message = ('已取消；已落盘数据保留，可再次下载' if job.cancelled else
@@ -296,13 +300,16 @@ class Terminal:
                 except (ValueError, TypeError, KeyError) as exc:
                     self.message = f'无法读取任务结果：{exc}'
             auto_refresh=action in ('device','live','blink') and (bool((job.payload or {}).get('auto_synced')) or bool(self.data_view and (self.data_view.get('info') or {}).get('auto_sync')))
-            if auto_refresh or action in ('download', 'import', 'migrate', 'configure', 'register', 'identify', 'set', 'set-batch', 'metadata', 'data-preferences', 'clear-history', 'erase-device'):
+            if auto_refresh or action in ('followup','download', 'import', 'migrate', 'configure', 'register', 'identify', 'set', 'set-batch', 'metadata', 'data-preferences', 'clear-history', 'erase-device'):
                 self.refresh_message = self.message
                 self.start('list', ['list'])
-            if action in ('download','set-batch') or (value and action != 'list'):
+            if action in ('download','set-batch','followup') or (value and action != 'list'):
                 outcomes = (job.payload or {}).get('configurations' if action=='set-batch' else 'downloads', job.outcomes) if isinstance(job.payload, dict) else job.outcomes
                 failures = job.failures or ([{'code': 'cancelled', 'message': '任务已取消，已落盘数据保留。',
                                             'retryable': True, 'action': '可稍后重新下载。'}] if job.cancelled else [])
+                if action=='followup':
+                    saved={item['serial'] for item in outcomes if item.get('status') in ('downloaded','up_to_date','empty','saved_warning')}
+                    failures=[f for f in failures if f.get('serial') not in saved]
                 if value and not failures:
                     failures = [{'code': 'worker_failed', 'message': '后台任务未完成。', 'retryable': False,
                                  'action': '按 l 查看日志，检查后台启动或事件通信问题。'}]
@@ -330,6 +337,10 @@ class Terminal:
                              f'预计剩余 {TransferProgress.duration(event["eta"])}')
         elif kind == 'result':
             self.job.payload = event['data']
+            if self.action=='followup' and isinstance(event['data'],dict):
+                data=event['data'];self.followup=data.get('followup',{})
+                self.devices=merge_devices(self.devices,data.get('devices',[]),scan=bool(data.get('devices')))
+                self.message=f"随访中 · 已保存 {self.followup.get('saved',0)} · 下载中 {self.followup.get('active',0)} · 排队 {self.followup.get('waiting',0)} · 待处理 {self.followup.get('failed',0)} · c 停止"
             if self.action in ('export', 'backup', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'clear-history', 'erase-device', 'device-count'):
                 self.logs.append('结果：' + json.dumps(event['data'], ensure_ascii=False))
         elif kind == 'completed':
@@ -401,6 +412,11 @@ class Terminal:
                     'impact':'执行前自动生成完整SQLite备份；保留设备管理编号、受试者代号及审计。设备清除会先完整同步，采集不中止，读写间可能新增记录。',
                     'arguments':args}
                 return
+            elif action=='followup':
+                from .followup import validate
+                parallel,seconds=int(values[0]),float(values[1]);validate(parallel,seconds,3)
+                if self.start('followup',['followup','--parallel',str(parallel),'--scan-seconds',str(seconds),'--execute']) is False:
+                    self.form['error']=self.message;return
             elif action=='metadata':
                 from .metadata import clean
                 old=self.form['before']
@@ -533,7 +549,7 @@ class Terminal:
                 self.review=retry_batch_settings_plan(view['arguments'],outcomes,self.devices)
                 if self.review is None:view['notice']='所有目标均已成功，无需重试'
             except ValueError as exc:view['notice']=str(exc)
-        elif key=='r' and view['action'] not in ('set','set-batch','blink','clear-history','erase-device') and any(f.get('retryable') for f in view['failures']) and not self.job:
+        elif key=='r' and view['action'] not in ('followup','set','set-batch','blink','clear-history','erase-device') and any(f.get('retryable') for f in view['failures']) and not self.job:
             args=retry_download_arguments(view['arguments'],outcomes,view['failures']) if view['action']=='download' else view['arguments']
             if args is None: self.message='所有可重试项均已保存；其余问题请核对后从列表选择'
             elif self.start(view['action'],args) is not False: self.result_view=None
@@ -686,7 +702,9 @@ class Terminal:
             else:self.selected=max(0,len(self.devices)-1)
         elif not self.job:
             device = self.selected_device()
-            if key=='u':
+            if key=='f':
+                self.open_form('随访：已登记设备到场自动下载；本场成功只处理一次',[('并发数（1–8）',6),('扫描窗口秒数（5–60）',8)],'followup')
+            elif key=='u':
                 self.marked.clear();self.message='已清空勾选；Enter 下载当前设备，A 全选附近设备'
             elif key in ('\x01','A'):
                 self.marked={item['serial'] for item in self.devices.values() if item.get('serial') and item.get('nearby') and not item.get('identity_conflict') and item.get('history_supported') is not False}
@@ -916,10 +934,13 @@ class Terminal:
         self.screen.refresh()
 
     def draw_dashboard(self,height,width):
-        self.put(0,f'Kestrel DROP · {__version__}',curses.A_BOLD)
+        self.put(0,f'Kestrel DROP · {__version__}'+(' · 随访模式' if self.followup is not None else ''),curses.A_BOLD)
         self.put(1,f'数据目录：{self.library.root}',curses.A_DIM)
         nearby=sum(bool(item.get('nearby')) for item in self.devices.values())
-        self.put(2,f'近10分钟 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.parallel}')
+        self.put(2,f'近10分钟 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.followup.get("parallel",6) if self.followup is not None else self.parallel}')
+        if self.followup is not None:
+            f=self.followup
+            self.put(2,f"随访并发 {f.get('parallel',6)} · 已保存 {f.get('saved',0)} · 下载中 {f.get('active',0)} · 排队 {f.get('waiting',0)} · 待处理 {f.get('failed',0)} · c 停止")
         values=list(self.devices.values())
         if values:
             item=values[min(self.selected,len(values)-1)]
@@ -963,7 +984,7 @@ class Terminal:
         log_start=row+4
         for offset,line in enumerate(list(self.logs)[-max(1,height-log_start-3):]):self.put(log_start+offset,line,curses.A_DIM)
         self.put(height-2,'Enter 下载所选/当前  s 扫描  空格勾选  A 全选  a 下载所选  g 设置')
-        self.put(height-1,'h 数据管理  z 资料  q 退出  ? 帮助  t 诊断  j 并发  b 备份  l 日志',curses.A_DIM)
+        self.put(height-1,'f 随访  h 数据管理  z 资料  q 退出  ? 帮助  t 诊断  j 并发  b 备份  l 日志',curses.A_DIM)
 
     def draw_preview(self,height,width):
         self.screen.erase()
@@ -1126,7 +1147,7 @@ class Terminal:
             if item.get('last_timestamp'):lines.append('末条设备记录时间：'+item['last_timestamp'])
         for row,line in enumerate(lines[:5],height-8):self.put(row,line)
         if view['action']=='set-batch':retry=batch_retry is not None
-        else:retry=view['action'] not in ('set','blink','clear-history','erase-device') and any(f.get('retryable') for f in view['failures'])
+        else:retry=view['action'] not in ('followup','set','blink','clear-history','erase-device') and any(f.get('retryable') for f in view['failures'])
         self.put(height-2,('r 仅重试未成功项 · ' if retry and not self.job and view['action']=='set-batch' else 'r 仅重试未完成项 · ' if retry and not self.job else '')+'l 日志 · Esc / Enter 返回')
         self.put(height-1,'g 读取当前设备核对 · l 日志 · b 数据库备份' if view['action']=='set-batch' else 'v 查看当前设备记录 · e 导出 · b 数据库备份',curses.A_DIM)
 
