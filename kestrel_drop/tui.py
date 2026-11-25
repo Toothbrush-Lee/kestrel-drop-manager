@@ -23,7 +23,7 @@ from .ui_text import clip, wrap_lines, input_window
 from .ui_table import device_columns,result_columns,table_row,PREVIEW_COLUMNS
 from .ui_actions import format_interval, setting_change, retry_download_arguments, selected_devices, batch_setting_change, retry_batch_settings_plan
 
-PHASES = {'followup_scanning':'随访：持续扫描到场设备','scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
+PHASES = {'clock_warning':'时钟偏差告警，已登记','followup_scanning':'随访：持续扫描到场设备','scanning': '扫描附近设备', 'locating': '定位目标设备（找到全部地址后连接）', 'connecting': '连接设备', 'identifying': '核对型号和序列号',
           'querying': '查询新增记录', 'receiving': '接收并保存连续数据块', 'verifying': '验证完整性和完成游标',
           'saving': '发布下载档案', 'archive_check': '检查本地档案', 'indexing': '校验并入库', 'auto_sync':'连接后自动同步历史', 'backing_up':'正在完整备份电脑档案', 'clearing_local':'正在清除本机历史（设备不改）', 'erasing_device':'正在清除设备日志（电脑历史保留）', 'checking_device_count':'正在回读设备日志条数', 'reading_settings':'正在读取设备设置'}
 STATUSES = {'downloaded': '已保存', 'saved_warning': '已保存，有提醒', 'up_to_date': '已经是最新', 'pending': '有数据尚未确认',
@@ -174,6 +174,8 @@ class Terminal:
             return False
         if action=='list': self.list_stamp=self.database_stamp()
         if action in ('download','set-batch','followup'): self.device_progress={}
+        if action=='followup':
+            for item in self.devices.values():item.pop('clock_warning',None)
         if action=='followup':self.followup={'parallel':int(arguments[arguments.index('--parallel')+1]) if '--parallel' in arguments else 6}
         self.action = action
         self.progress = ''
@@ -329,6 +331,8 @@ class Terminal:
         if kind == 'log':
             self.logs.append(event['message'])
         elif kind == 'phase':
+            if event['phase']=='clock_warning':
+                self.devices.setdefault(event['serial'],{'serial':event['serial']})['clock_warning']=event.get('message','设备时钟告警')
             if event['phase'] in ('backing_up','clearing_local','erasing_device','checking_device_count','reading_settings'):self.progress=''
             self.message = f'{event.get("serial", "")} · {PHASES.get(event["phase"], event["phase"])}'
         elif kind == 'progress':
@@ -415,7 +419,11 @@ class Terminal:
             elif action=='followup':
                 from .followup import validate
                 parallel,seconds=int(values[0]),float(values[1]);validate(parallel,seconds,3)
-                if self.start('followup',['followup','--parallel',str(parallel),'--scan-seconds',str(seconds),'--execute']) is False:
+                mode=values[2].strip().lower() if len(values)>2 else 'off'
+                if mode not in ('on','off'):raise ValueError('自动校时填写on或off；on表示接受采样相位变化')
+                args=['followup','--parallel',str(parallel),'--scan-seconds',str(seconds),'--execute']
+                if mode=='on':args+=['--sync-clock','--allow-schedule-shift']
+                if self.start('followup',args) is False:
                     self.form['error']=self.message;return
             elif action=='metadata':
                 from .metadata import clean
@@ -703,7 +711,7 @@ class Terminal:
         elif not self.job:
             device = self.selected_device()
             if key=='f':
-                self.open_form('随访：已登记设备到场自动下载；本场成功只处理一次',[('并发数（1–8）',6),('扫描窗口秒数（5–60）',8)],'followup')
+                self.open_form('随访：检查时钟后下载；自动校时会影响采样相位',[('并发数（1–8）',6),('扫描窗口秒数（5–60）',8),('自动校时on/off（on接受相位变化）','off')],'followup')
             elif key=='u':
                 self.marked.clear();self.message='已清空勾选；Enter 下载当前设备，A 全选附近设备'
             elif key in ('\x01','A'):
@@ -940,7 +948,7 @@ class Terminal:
         self.put(2,f'近10分钟 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.followup.get("parallel",6) if self.followup is not None else self.parallel}')
         if self.followup is not None:
             f=self.followup
-            self.put(2,f"随访并发 {f.get('parallel',6)} · 已保存 {f.get('saved',0)} · 下载中 {f.get('active',0)} · 排队 {f.get('waiting',0)} · 待处理 {f.get('failed',0)} · c 停止")
+            self.put(2,f"随访并发 {f.get('parallel',6)} · 已保存 {f.get('saved',0)} · 下载中 {f.get('active',0)} · 排队 {f.get('waiting',0)} · 待处理 {f.get('failed',0)} · 时钟告警 {sum(bool(d.get('clock_warning')) for d in self.devices.values())} · c 停止")
         values=list(self.devices.values())
         if values:
             item=values[min(self.selected,len(values)-1)]
@@ -961,6 +969,7 @@ class Terminal:
                 elif progress.get('event')=='phase': state=PHASES.get(progress.get('phase'),state)
                 elif progress.get('event') in ('completed','configured'): state=STATUSES.get(progress.get('status'),state)
                 elif progress.get('event')=='error': state='未完成：'+progress.get('message','查看日志')
+            if self.followup is not None and item.get('clock_warning'):state='时钟! '+state
             location=('本次' if item.get('seen_this_scan') else '近期') if item.get('nearby') else '—'
             pending=item.get('pending_records')
             line=table_row(columns,{
@@ -985,6 +994,9 @@ class Terminal:
         for offset,line in enumerate(list(self.logs)[-max(1,height-log_start-3):]):self.put(log_start+offset,line,curses.A_DIM)
         self.put(height-2,'Enter 下载所选/当前  s 扫描  空格勾选  A 全选  a 下载所选  g 设置')
         self.put(height-1,'f 随访  h 数据管理  z 资料  q 退出  ? 帮助  t 诊断  j 并发  b 备份  l 日志',curses.A_DIM)
+        if self.followup is not None:
+            self.put(height-2,'c 停止随访并保留数据 · ↑↓ 查看设备 · l 日志 · q 退出')
+            self.put(height-1,'设备到场自动下载；时钟告警已登记；未登记设备需停止后核验',curses.A_DIM)
 
     def draw_preview(self,height,width):
         self.screen.erase()

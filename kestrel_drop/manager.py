@@ -182,13 +182,16 @@ class Library:
                    'first_timestamp': info['first_timestamp'] if info else None,
                    'last_timestamp': info['last_timestamp'] if info else None, 'code': code}
         if warning:
-            outcome.update(status='saved_warning', warning=warning)
+            outcome['warning']=warning
+            if not code:outcome['status']='saved_warning'
         self.download_results[serial] = outcome
         events.emit('completed', **outcome)
         return code
 
-    async def download(self, serial, *, execute=False, ble_id=None, timeout=20.0, maxrows=20000, progress_factory=None, discovery=None):
+    async def download(self, serial, *, execute=False, ble_id=None, timeout=20.0, maxrows=20000, progress_factory=None, discovery=None, clock_policy=None):
         serial = serial_number(serial)
+        if clock_policy and clock_policy.get('sync') and not clock_policy.get('allow_schedule_shift'):
+            raise ValueError('随访自动校时需明确确认采样相位风险')
         if timeout <= 0 or maxrows < 1:
             raise ValueError('扫描时间和记录上限必须为正数')
         if not execute:
@@ -197,13 +200,13 @@ class Library:
         owner = _collection.get()
         if owner is not None and owner[0] is self:
             return await self._download_locked(serial, owner[1], ble_id=ble_id, timeout=timeout,
-                                               maxrows=maxrows, progress_factory=progress_factory, discovery=discovery)
+                                               maxrows=maxrows, progress_factory=progress_factory, discovery=discovery, clock_policy=clock_policy)
         with writer_lock(self.root):
             store = self._writable_store()
             return await self._download_locked(serial, store, ble_id=ble_id, timeout=timeout,
-                                               maxrows=maxrows, progress_factory=progress_factory, discovery=discovery)
+                                               maxrows=maxrows, progress_factory=progress_factory, discovery=discovery, clock_policy=clock_policy)
 
-    async def _download_locked(self, serial, store, *, ble_id, timeout, maxrows, progress_factory, discovery):
+    async def _download_locked(self, serial, store, *, ble_id, timeout, maxrows, progress_factory, discovery, clock_policy=None):
         try:
             before = store.device(serial)['row_count']
         except FileNotFoundError:
@@ -214,17 +217,40 @@ class Library:
         from bleak import BleakClient
         device = await _ble_call(protocol.resolve_ble_device, args)
         events.emit('phase', serial=serial, phase='connecting')
+        clock_report=None;clock_correction=None
         async def connected():
+            nonlocal clock_report,clock_correction
             async with BleakClient(device, timeout=30) as client:
                 events.emit('phase', serial=serial, phase='identifying')
                 identity = await devices.read_identity(client, ble_id=getattr(device, 'address', ble_id))
                 devices.require_identity(identity, expected=serial, history=True)
-                return await self._sync_client(client,store,identity,maxrows=maxrows,progress_factory=progress_factory)
+                if clock_policy is not None:
+                    from . import followup_clock
+                    clock_report=await followup_clock.check(client,store,identity,phase='before_download')
+                code=await self._sync_client(client,store,identity,maxrows=maxrows,progress_factory=progress_factory)
+                if code==0 and clock_policy and clock_policy.get('sync'):
+                    # A failed/unknown correction must never be retried by the download scheduler.
+                    if clock_report['severity'] in ('normal','drift'):
+                        try:
+                            latest=await followup_clock.check(client,store,identity,phase='after_download')
+                            clock_correction=await followup_clock.correct(client,store,identity,latest)
+                            if latest['severity']!='normal':clock_report=latest
+                        except Exception as exc:
+                            # History is already committed. Never retry a possible clock write as a download failure.
+                            clock_report={**clock_report,'severity':'read_failed','error':str(exc)}
+                            clock_correction={'status':'unknown','error':str(exc)}
+                return code
         warning = None
         try:
             result = await _ble_call(connected)
         except CompletionAckFailure as exc:
             result, warning = 0, describe(exc)
+        if clock_report is not None:
+            from .followup_clock import warning as clock_warning
+            alert=clock_warning(clock_report,clock_correction)
+            if alert:
+                if warning:alert['message']+='；'+warning['message']
+                warning=alert
         return self.complete_download(serial, previous=before, code=result, warning=warning)
 
     async def _sync_client(self, client, store, identity, *, maxrows=20000, progress_factory=None):
@@ -640,7 +666,7 @@ def _run(args):
             return 2 if result['incomplete'] else 0
         elif args.command=='followup':
             from .followup import run
-            result=asyncio.run(run(library,parallel=args.parallel,scan_seconds=args.scan_seconds,max_attempts=args.max_attempts,rounds=args.rounds,execute=args.execute))
+            result=asyncio.run(run(library,parallel=args.parallel,scan_seconds=args.scan_seconds,max_attempts=args.max_attempts,rounds=args.rounds,execute=args.execute,sync_clock=args.sync_clock,allow_schedule_shift=args.allow_schedule_shift))
             events.result(result)
             return 2 if result.get('incomplete') else 0
         elif args.command == 'download':

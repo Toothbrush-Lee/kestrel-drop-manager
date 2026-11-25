@@ -15,10 +15,11 @@ def validate(parallel,scan_seconds,max_attempts):
     if type(max_attempts) is not int or not 1<=max_attempts<=5:raise ValueError('随访尝试次数须为1–5')
 
 
-async def run(library,*,parallel=6,scan_seconds=8,max_attempts=3,rounds=None,execute=False):
+async def run(library,*,parallel=6,scan_seconds=8,max_attempts=3,rounds=None,execute=False,sync_clock=False,allow_schedule_shift=False):
     validate(parallel,scan_seconds,max_attempts)
+    if sync_clock and not allow_schedule_shift:raise ValueError('自动校时可能改变采样相位，需 --allow-schedule-shift 明确确认')
     if rounds is not None and (type(rounds) is not int or rounds<1):raise ValueError('扫描轮数须为正整数')
-    if not execute:return {'status':'dry_run','parallel':parallel,'scan_seconds':scan_seconds,'registered_only':True}
+    if not execute:return {'status':'dry_run','parallel':parallel,'scan_seconds':scan_seconds,'registered_only':True,'sync_clock':sync_clock}
     registered={d['serial']:d for d in library.status()}
     if not registered:raise ValueError('请先核验登记设备，再进入随访模式')
     session=library.root/'followups'/(datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8]+'.json')
@@ -33,19 +34,21 @@ async def run(library,*,parallel=6,scan_seconds=8,max_attempts=3,rounds=None,exe
                 known_addresses.setdefault(address.casefold(),set()).add(serial)
                 break
     def save():
-        protocol._json_atomic(session,{'mode':'followup','parallel':parallel,'round':scan_round,'devices':states,'downloads':list(downloads.values())})
+        protocol._json_atomic(session,{'mode':'followup','parallel':parallel,'round':scan_round,'sync_clock':sync_clock,'devices':states,'downloads':list(downloads.values())})
     def publish(found):
         summary={'round':scan_round,'parallel':parallel,'active':sum(i['status']=='downloading' for i in states.values()),'waiting':len(waiting),
                  'saved':sum(i['status']=='saved' for i in states.values()),
+                 'clock_warnings':sum(i.get('warning',{}).get('code')=='followup_clock_warning' for i in states.values()),
                  'failed':sum(i['status'] in ('retry','blocked','interrupted','not_attempted') for i in states.values()),'session':str(session)}
         events.result({'followup':summary,'devices':found,'downloads':list(downloads.values())})
     async def collect(serial,observation,snapshot):
         item=states[serial];item.update(status='downloading',attempts=item['attempts']+1,attempt_time=datetime.now().astimezone().isoformat());save()
         try:
             with events.context(serial=serial):
-                code=await library.download(serial,execute=True,ble_id=observation['ble_id'],timeout=scan_seconds,discovery=snapshot)
+                code=await library.download(serial,execute=True,ble_id=observation['ble_id'],timeout=scan_seconds,discovery=snapshot,clock_policy={'sync':sync_clock,'allow_schedule_shift':allow_schedule_shift})
             outcome=library.download_results[serial];downloads[serial]=outcome
             item.update(status='saved' if not code else 'retry',last_status=outcome['status'])
+            if outcome.get('warning'):item['warning']=outcome['warning']
             retry=bool(code)
         except (OSError,RuntimeError,ValueError) as exc:
             error=describe(exc);item.update(status='retry',error=error)

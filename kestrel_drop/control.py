@@ -198,7 +198,7 @@ async def inspect(client, *, stable=None, clock_read=None, settings_read=None):
     return result
 
 
-async def apply(client, changes, before, *, allow_schedule_shift=False):
+async def apply(client, changes, before, *, allow_schedule_shift=False, clock_correction_limit=None):
     """Write individually, verify each field, never retry an ambiguous write."""
     changes = validate_changes(changes)
     if 'time' in changes and allow_schedule_shift is not True:
@@ -233,6 +233,8 @@ async def apply(client, changes, before, *, allow_schedule_shift=False):
             if changes['time']=='now':
                 value=computer_clock.replace(tzinfo=None).isoformat(sep=' ')
                 correction=(datetime.fromisoformat(value)-datetime.fromisoformat(clock_before[0])).total_seconds()
+            if clock_correction_limit is not None and abs(correction)>=clock_correction_limit:
+                raise TransferError('时差已达到人工核对阈值，未发送校时命令')
             return value
         clock_read=clock_before if skipped else await clock(client,target_at_send)
         actual,_ = clock_read
