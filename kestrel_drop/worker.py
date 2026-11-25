@@ -1,5 +1,6 @@
 """Cancelable CLI worker and validated JSON-lines transport for the TUI."""
 import json
+from collections import deque
 import math
 import os
 from pathlib import Path
@@ -104,6 +105,7 @@ class Job:
         self.cancelled = False
         self.arguments = list(arguments)
         self.payload = None
+        self.stderr_tail = deque(maxlen=20)
         self.failures = []
         self.outcomes = []
         self.protocol_error = False
@@ -121,6 +123,7 @@ class Job:
         def errors():
             try:
                 for line in self.process.stderr:
+                    self.stderr_tail.append(line.rstrip())
                     self.events.put(('stderr', line.rstrip()))
             finally:
                 self.process.stderr.close()
@@ -137,6 +140,7 @@ class Job:
                     self.events.put(('event', event))
                 except (ValueError, TypeError):
                     self.protocol_error = True
+                    self.stderr_tail.append('后台事件格式错误：' + line.rstrip())
                     self.events.put(('stderr', '后台事件格式错误：' + line.rstrip()))
         finally:
             self.process.stdout.close()

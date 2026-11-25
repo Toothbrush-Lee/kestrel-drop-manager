@@ -28,6 +28,11 @@ def smoke(prefix):
         stream = [json.loads(line) for line in run('--events-json','list').splitlines()]
         assert any(item['event']=='result' and item['data']==[] for item in stream), stream
         assert stream[-1]['event']=='finished' and stream[-1]['code']==0, stream
+        for flags in ([],['--sync-clock','--allow-schedule-shift']):
+            preview=[json.loads(line) for line in run('--events-json','followup',*flags).splitlines()]
+            assert preview[-1]['event']=='finished' and preview[-1]['code']==0, preview
+            result=next(e['data'] for e in preview if e['event']=='result')
+            assert result['status']=='dry_run' and result['sync_clock']==bool(flags),result
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 120, 0, 0))
         process = subprocess.Popen(prefix, cwd=root, env=env, stdin=slave, stdout=slave, stderr=slave)

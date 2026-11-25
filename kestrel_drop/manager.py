@@ -481,6 +481,8 @@ def parser():
     follow.add_argument('--scan-seconds',type=float,default=8)
     follow.add_argument('--max-attempts',type=int,default=3)
     follow.add_argument('--rounds',type=int,default=None,help='限制扫描轮数；默认持续运行至Ctrl+C')
+    follow.add_argument('--sync-clock',action='store_true',help='历史确认后自动校准小幅漂移；须确认采样相位风险')
+    follow.add_argument('--allow-schedule-shift',action='store_true',help='确认自动校时可能改变采样相位')
     follow.add_argument('--execute',action='store_true')
     download = sub.add_parser('download', help='首次完整下载或自动增量同步')
     target = download.add_mutually_exclusive_group(required=True)

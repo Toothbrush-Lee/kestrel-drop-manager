@@ -313,7 +313,9 @@ class Terminal:
                     saved={item['serial'] for item in outcomes if item.get('status') in ('downloaded','up_to_date','empty','saved_warning')}
                     failures=[f for f in failures if f.get('serial') not in saved]
                 if value and not failures:
-                    failures = [{'code': 'worker_failed', 'message': '后台任务未完成。', 'retryable': False,
+                    details=list(getattr(job,'stderr_tail',[]))
+                    reason=f'后台退出码 {value}：'+next((line for line in reversed(details) if line.strip()),'后台未返回具体错误，按l查看任务日志')
+                    failures = [{'code': 'worker_failed', 'message': reason, 'retryable': False,
                                  'action': '按 l 查看日志，检查后台启动或事件通信问题。'}]
                 if action in ('set','blink','set-batch','clear-history','erase-device'):
                     for failure in failures: failure['retryable']=False
