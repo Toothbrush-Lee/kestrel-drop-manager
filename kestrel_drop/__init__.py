@@ -1,3 +1,3 @@
 """Kestrel DROP D1/D2/D3 download manager, terminal UI, and BLE protocol."""
 
-__version__ = "0.16.2"
+__version__ = "0.16.3"

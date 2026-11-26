@@ -20,6 +20,7 @@ from .errors import TITLES
 from .devices import model_type
 from .worker import Job
 from .ui_text import clip, wrap_lines, input_window
+from .ui_sort import ordered_devices,SORT_LABELS
 from .ui_table import device_columns,result_columns,table_row,PREVIEW_COLUMNS
 from .ui_actions import format_interval, setting_change, retry_download_arguments, selected_devices, batch_setting_change, retry_batch_settings_plan
 
@@ -110,6 +111,7 @@ class Terminal:
         self.screen, self.library = screen, library
         self.devices = {}
         self.selected = 0
+        self.sort_mode = 'management'
         self.marked = set()
         self.logs = deque(maxlen=500)
         self.job = None
@@ -138,6 +140,18 @@ class Terminal:
         self.list_stamp = None
         self.next_local_refresh = 0
 
+    def merge_sorted_devices(self,incoming,*,scan=False):
+        anchor=list(self.devices)[self.selected] if self.devices and self.selected<len(self.devices) else None
+        result=ordered_devices(merge_devices(self.devices,incoming,scan=scan),self.sort_mode)
+        self.selected=list(result).index(anchor) if anchor in result else min(self.selected,max(0,len(result)-1))
+        return result
+
+    def sort_devices(self):
+        anchor=list(self.devices)[self.selected] if self.devices and self.selected<len(self.devices) else None
+        self.devices=ordered_devices(self.devices,self.sort_mode)
+        self.selected=list(self.devices).index(anchor) if anchor in self.devices else min(self.selected,max(0,len(self.devices)-1))
+        self.needs_redraw=True
+
     def database_stamp(self):
         result=[]
         for name in ('library.sqlite','library.sqlite-wal'):
@@ -165,6 +179,7 @@ class Terminal:
         self.marked.difference_update(before-after)
         self.marked.intersection_update(item.get('serial') for item in updated.values() if not item.get('identity_conflict'))
         self.selected=list(updated).index(selected_key) if selected_key in updated else min(self.selected,max(0,len(updated)-1))
+        self.sort_devices()
         self.needs_redraw=True
 
     def start(self, action, arguments):
@@ -223,13 +238,9 @@ class Terminal:
                     if payload is None:
                         raise ValueError(job.failures[0]['action'] if job.failures else '后台未返回结果')
                     if action == 'scan':
-                        selected = self.selected_device()
-                        selected_serial = selected.get('serial') if selected else None
-                        self.devices = merge_devices(self.devices, payload, scan=True)
+                        self.devices = self.merge_sorted_devices(payload,scan=True)
                         self.marked.intersection_update(item.get('serial') for item in self.devices.values() if item.get('nearby') and not item.get('identity_conflict') and item.get('history_supported') is not False)
                         self.selected = min(self.selected, max(0, len(self.devices)-1))
-                        if selected_serial and selected_serial in self.devices:
-                            self.selected = list(self.devices).index(selected_serial)
                         self.message = f'本次发现 {len(payload)} 台；近10分钟累计 {sum(bool(item.get("nearby")) for item in self.devices.values())} 台；保留有效勾选 · A全选 / u清空'
                         if any(item.get('auto_sync_error') for item in payload):self.message='身份核验登记已完成，但有自动同步未完成项，按l核对日志'
                     elif action == 'list':
@@ -240,7 +251,7 @@ class Terminal:
                                           'last_timestamp', 'initial_attempts', 'initial_partial_files', 'superseded_records', 'resumable_records', 'note',
                                           'database', 'database_records', 'database_next_cursor', 'database_added_records'):
                                 device.pop(field, None)
-                        self.devices = merge_devices(self.devices, payload)
+                        self.devices = self.merge_sorted_devices(payload)
                         self.selected = min(self.selected, max(0, len(self.devices)-1))
                         failures = sum(bool(item.get('error')) for item in payload)
                         self.message = (f'{failures} 个档案校验或入库失败，请查看选中设备及日志' if failures else
@@ -262,7 +273,7 @@ class Terminal:
                     elif action == 'records':
                         self.preview, self.preview_offset = list(reversed(payload)), 0
                     elif action in ('register', 'identify'):
-                        self.devices = merge_devices(self.devices, [payload])
+                        self.devices = self.merge_sorted_devices([payload])
                         serial = payload.get('serial')
                         if serial and serial in self.devices:
                             self.selected = list(self.devices).index(serial)
@@ -279,7 +290,7 @@ class Terminal:
                             self.data_view['notice']='电脑历史已清除；设备未改动。备份完整路径按l查看。' if action=='clear-history' else '设备清除已回读0条；电脑历史保留。备份路径按l查看。'
                         self.message=('本机历史已清除；设备未改动' if action=='clear-history' else '设备日志已清除并回读0条；电脑历史保留')+'；备份：'+payload['backup']
                     elif action=='metadata':
-                        self.devices=merge_devices(self.devices,[payload])
+                        self.devices=self.merge_sorted_devices([payload])
                         self.message='本地设备资料已保存；不改变设备设置或历史观测归属'
                     elif action == 'backup':
                         self.message = f'数据库备份完成：{payload["backup"]}（按 l 查看完整路径）'
@@ -345,7 +356,7 @@ class Terminal:
             self.job.payload = event['data']
             if self.action=='followup' and isinstance(event['data'],dict):
                 data=event['data'];self.followup=data.get('followup',{})
-                self.devices=merge_devices(self.devices,data.get('devices',[]),scan=bool(data.get('devices')))
+                self.devices=self.merge_sorted_devices(data.get('devices',[]),scan=bool(data.get('devices')))
                 self.message=f"随访中 · 已保存 {self.followup.get('saved',0)} · 下载中 {self.followup.get('active',0)} · 排队 {self.followup.get('waiting',0)} · 待处理 {self.followup.get('failed',0)} · c 停止"
             if self.action in ('export', 'backup', 'import', 'migrate', 'configure', 'register', 'identify', 'device', 'set', 'clear-history', 'erase-device', 'device-count'):
                 self.logs.append('结果：' + json.dumps(event['data'], ensure_ascii=False))
@@ -507,6 +518,7 @@ class Terminal:
             self.text_offset=max(0,len(self.wrapped_text())-self.screen.getmaxyx()[0]+4)
         else:
             self.text_view=[
+                'k 切换设备编号/受试者编号排序，数字自然排序，未填写项在末尾；保留当前设备和勾选。',
                 'h 数据管理：同步/导出、日志设置、连接后自动同步，以及分开的电脑历史与设备日志清除。',
                 'z 编辑当前设备的本地管理编号和受试者代号；预览后确认保存，不连接蓝牙。',
                 '快速开始：s 扫描 15 秒 → ↑↓ 选择 → Enter 下载 → e 导出。',
@@ -686,6 +698,10 @@ class Terminal:
                 if state.get('ble_id'):args+=['--ble-id',state['ble_id']]
                 if action=='blink':args+=['--execute']
                 self.start(action,args)
+            return True
+        if key=='k':
+            self.sort_mode='participant' if self.sort_mode=='management' else 'management'
+            self.sort_devices();self.message='当前按'+SORT_LABELS[self.sort_mode]+'排序；未填写项在末尾，勾选保留'
             return True
         if key=='\x1b':
             self.message='已在设备列表；按 q 退出'
@@ -944,7 +960,7 @@ class Terminal:
         self.screen.refresh()
 
     def draw_dashboard(self,height,width):
-        self.put(0,f'Kestrel DROP · {__version__}'+(' · 随访模式' if self.followup is not None else ''),curses.A_BOLD)
+        self.put(0,f'Kestrel DROP · {__version__}'+(' · 随访模式' if self.followup is not None else '')+f' · 排序：{SORT_LABELS[self.sort_mode]} [k]',curses.A_BOLD)
         self.put(1,f'数据目录：{self.library.root}',curses.A_DIM)
         nearby=sum(bool(item.get('nearby')) for item in self.devices.values())
         self.put(2,f'近10分钟 {nearby} 台 · 已选 {len(self.marked)} 台 · 并发 {self.followup.get("parallel",6) if self.followup is not None else self.parallel}')
